@@ -1,0 +1,10 @@
+{
+  "acoes_br": ["PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBAS3.SA", "WEGE3.SA", "BBDC4.SA", "ABEV3.SA", "HGLG11.SA"],
+  "acoes_us": ["AAPL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "GOOGL"],
+  "etfs": ["SPY", "QQQ", "EEM", "EWZ", "BOVA11.SA"],
+  "indices": ["^BVSP", "^GSPC", "^NDX", "^DJI", "^VIX"],
+  "fx": ["BRL=X", "EURUSD=X", "JPY=X"],
+  "cripto": ["BTC-USD", "ETH-USD", "SOL-USD"],
+  "futuros": ["GC=F", "SI=F", "CL=F", "NG=F", "ZS=F"],
+  "custom": []
+}
