@@ -383,10 +383,11 @@ with tabs[1]:
         cat2 = st.selectbox("Categoria", list(lists_data.keys()), index=0, key="cat_detail")
         tk2 = st.selectbox("Ticker", lists_data[cat2], index=0, key="tk_detail")
         show_mc = st.checkbox("Executar Monte Carlo (rápido)", value=True, help="Simula probabilidade de tocar stop/target no horizonte.")
-        n_sims = st.slider("N simulações", 200, 3000, 800, 50)
+        n_sims = st.slider("N simulações", 200, 3000, 800, 50, key="n_sims_detail")
     with colB:
-        capital = st.number_input("Capital (R$ / USD)", min_value=1000.0, value=100000.0, step=1000.0)
-        risk_pct_detail = st.slider("Risco por trade (%)", 0.5, 5.0, 2.0, 0.5)
+        capital = st.number_input("Capital (R$ / USD)", min_value=1000.0, value=100000.0, step=1000.0, key="capital_detail")
+        # >>>>>>> CORREÇÃO AQUI: adicionamos key único <<<<<<<<
+        risk_pct_detail = st.slider("Risco por trade (%)", 0.5, 5.0, 2.0, 0.5, key="risk_pct_detail_slider")
 
     df2 = yf_download(tk2, period=period, interval=interval)
     if df2.empty:
