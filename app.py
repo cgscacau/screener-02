@@ -17,6 +17,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+import re  # <-- NOVO
+
 
 # =============== Predição (opcional) ===============
 SKLEARN_OK = True
@@ -308,6 +310,8 @@ with st.sidebar.expander("⛏️ Universo de Ativos", expanded=True):
                 st.session_state.asset_bank = list(dict.fromkeys(st.session_state.asset_bank + new))
                 save_asset_bank(st.session_state.asset_bank)
                 st.success(f"Adicionados {len(new)} tickers ao banco.")
+                st.rerun()  # <-- garante que apareçam no multiselect imediatamente
+
         selected = st.multiselect(
             "Selecione os ativos para este estudo",
             options=st.session_state.asset_bank,
@@ -674,15 +678,33 @@ with tabs[5]:
     st.subheader("📚 Banco de Ativos (CRUD)")
     st.caption("Gerencie o banco mestre de tickers usado pelo app. Salva em `ativos.json`.")
 
-    bank_df = pd.DataFrame({"Ticker": st.session_state.asset_bank}).sort_values("Ticker").reset_index(drop=True)
-    edited_bank = st.data_editor(
-        bank_df, num_rows="dynamic", use_container_width=True, key="editor_bank",
-        column_config={"Ticker": st.column_config.TextColumn(help="Ticker Yahoo (ex.: PETR4.SA, AAPL, BTC-USD)")}
-    )
+    # DataFrame com dtype explícito (evita incompatibilidades do editor)
+    bank_df = pd.DataFrame({"Ticker": pd.Series(st.session_state.asset_bank, dtype="string")})
+    bank_df = bank_df.sort_values("Ticker").reset_index(drop=True)
 
-    clean_list = (edited_bank["Ticker"].astype(str).str.upper().str.strip())
-    clean_list = [t for t in clean_list if t]
-    clean_list = list(dict.fromkeys(clean_list))
+    # Editor resiliente: tenta data_editor, senão cai para textarea
+    try:
+        edited_bank = st.data_editor(
+            bank_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_bank",
+            # OBS: sem column_config para evitar checagens rígidas de tipo em algumas versões
+        )
+        clean_list = edited_bank["Ticker"].astype("string").str.upper().str.strip().tolist()
+        clean_list = [t for t in clean_list if t]
+        clean_list = list(dict.fromkeys(clean_list))
+    except Exception as e:
+        st.warning(f"Editor avançado não pôde ser renderizado ({e.__class__.__name__}). Usando modo simples.")
+        fallback_text = st.text_area(
+            "Tickers (1 por linha ou separados por vírgula)",
+            value="\n".join(st.session_state.asset_bank),
+            key="bank_fallback_text",
+            height=200
+        )
+        parts = re.split(r"[,\s]+", fallback_text)
+        clean_list = [p.strip().upper() for p in parts if p.strip()]
+        clean_list = list(dict.fromkeys(clean_list))
 
     colbk1, colbk2, colbk3, colbk4 = st.columns([1,1,1,1])
     with colbk1:
@@ -694,10 +716,13 @@ with tabs[5]:
         if st.button("📂 Recarregar banco", key="reload_bank"):
             st.session_state.asset_bank = load_asset_bank()
             st.success("Banco recarregado.")
+            st.rerun()
     with colbk3:
-        st.download_button("⬇️ Exportar banco (JSON)",
-                           data=json.dumps({"tickers": clean_list}, ensure_ascii=False, indent=2),
-                           file_name="ativos.json", mime="application/json", key="export_bank_dl")
+        st.download_button(
+            "⬇️ Exportar banco (JSON)",
+            data=json.dumps({"tickers": clean_list}, ensure_ascii=False, indent=2),
+            file_name="ativos.json", mime="application/json", key="export_bank_dl"
+        )
     with colbk4:
         upb = st.file_uploader("Importar banco (JSON)", type=["json"], key="import_bank")
         if upb is not None:
