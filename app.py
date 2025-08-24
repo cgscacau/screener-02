@@ -1,20 +1,17 @@
 # app.py
 # -*- coding: utf-8 -*-
-# Super Screener + Predição + Carteira — Visual Moderno — Yahoo Finance (versão robusta)
+# Super Screener + Predição + Carteira — com Banco de Ativos (CRUD) e Edição de Carteira
 
-import os
-import io
-import json
-import math
-import time
+import json, math, time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
 # ======== Predição (opcional) ========
 SKLEARN_OK = True
@@ -27,13 +24,13 @@ except Exception:
 
 # ======== Config Global ========
 st.set_page_config(
-    page_title="Cacau — Super Screener + Predição + Carteira",
+    page_title="Super Screener + Predição + Carteira",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ======== Estilo (CSS) — Visual Moderno ========
+# ======== Estilo (CSS) — Visual ========
 st.markdown("""
 <style>
 html, body, [class*="css"]  { font-family: "Inter", system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
@@ -44,12 +41,6 @@ div.block-container{padding-top:1.1rem; padding-bottom:2rem;}
   box-shadow: 0 2px 14px rgba(2,6,23,0.04);
 }
 .stButton>button { border-radius: 12px; padding: 0.55rem 0.9rem; border: 1px solid #e2e8f0; }
-.badge { display:inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600; letter-spacing:.02em; }
-.badge-buy { background:#dcfce7; color:#166534; border: 1px solid #86efac;}
-.badge-strongbuy { background:#bbf7d0; color:#14532d; border: 1px solid #4ade80;}
-.badge-sell { background:#fee2e2; color:#7f1d1d; border: 1px solid #fca5a5;}
-.badge-strongsell { background:#fecaca; color:#7f1d1d; border: 1px solid #f87171;}
-.badge-neutral { background:#e2e8f0; color:#0f172a; border: 1px solid #cbd5e1;}
 [data-testid="stDataFrame"] div[role="table"] { font-size: 0.95rem; }
 </style>
 """, unsafe_allow_html=True)
@@ -59,24 +50,52 @@ TODAY = datetime.now().date()
 DEFAULT_START = TODAY - timedelta(days=365 * 3)
 DEFAULT_END = TODAY
 
-# ======== Yahoo Finance (download robusto) ========
-import yfinance as yf
+# ======== Arquivos de persistência ========
+ASSET_BANK_FILE = Path("ativos.json")            # banco de ativos
+PORTFOLIO_FILE  = Path("carteira.json")          # carteira salva
 
+# ======== Sessão ========
+if "asset_bank" not in st.session_state:
+    st.session_state.asset_bank: List[str] = []
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = pd.DataFrame(columns=["Ticker","Peso"])
+
+# ======== Util: persistência banco de ativos ========
+def load_asset_bank() -> List[str]:
+    # aceita { "tickers": [...] } ou lista direta
+    if ASSET_BANK_FILE.exists():
+        try:
+            data = json.loads(ASSET_BANK_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                lst = data
+            else:
+                lst = data.get("tickers") or data.get("ativos") or []
+            lst = [str(t).strip().upper() for t in lst if str(t).strip()]
+            return list(dict.fromkeys(lst))
+        except Exception:
+            pass
+    return []
+
+def save_asset_bank(tickers: List[str]) -> None:
+    tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    tickers = list(dict.fromkeys(tickers))
+    ASSET_BANK_FILE.write_text(json.dumps({"tickers": tickers}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# Carrega banco na inicialização
+if not st.session_state.asset_bank:
+    st.session_state.asset_bank = load_asset_bank()
+
+# ======== Yahoo Finance (download robusto) ========
 @st.cache_data(ttl=60 * 60)
 def yf_download(tickers, start=None, end=None, period=None, interval="1d", tries=3, pause=0.8) -> pd.DataFrame:
-    """
-    Baixa dados de 1..N tickers com retries e normaliza o MultiIndex (ticker, OHLC).
-    Pula o ticker se falhar repetidamente (log simples no console).
-    """
     if isinstance(tickers, str):
         tick_list = [tickers]
     else:
         tick_list = list(dict.fromkeys([t for t in tickers if t]))
 
-    # Guard especial para intraday (histórico limitado pelo Yahoo)
-    if interval in ("1h", "90m", "30m", "15m", "5m", "1m") and start:
+    if interval in ("1h","90m","30m","15m","5m","1m") and start:
         start_dt = pd.to_datetime(start).date()
-        max_back = TODAY - timedelta(days=720)  # ~2 anos
+        max_back = TODAY - timedelta(days=720)
         if start_dt < max_back:
             start = str(max_back)
 
@@ -90,7 +109,6 @@ def yf_download(tickers, start=None, end=None, period=None, interval="1d", tries
                     group_by="ticker", threads=False, progress=False
                 )
                 if df is not None and not df.empty:
-                    # se veio SingleIndex (1 ticker), envolve como MultiIndex (tk, OHLC)
                     if not isinstance(df.columns, pd.MultiIndex):
                         df = pd.concat({tk: df}, axis=1)
                     frames.append(df)
@@ -104,10 +122,7 @@ def yf_download(tickers, start=None, end=None, period=None, interval="1d", tries
     if not frames:
         return pd.DataFrame()
 
-    raw = pd.concat(frames, axis=1)
-    raw = raw.sort_index(axis=1)
-
-    # Normaliza níveis: garantir (ticker, OHLC)
+    raw = pd.concat(frames, axis=1).sort_index(axis=1)
     if isinstance(raw.columns, pd.MultiIndex):
         lv0 = set(raw.columns.get_level_values(0))
         lv1 = set(raw.columns.get_level_values(1))
@@ -115,65 +130,21 @@ def yf_download(tickers, start=None, end=None, period=None, interval="1d", tries
             raw = raw.swaplevel(axis=1).sort_index(axis=1)
     return raw.dropna(how="all")
 
-def _ensure_multiindex(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        return df
-    return pd.concat({ticker: df}, axis=1)
-
-def get_field_wide(raw: pd.DataFrame, field: str) -> pd.DataFrame:
-    """
-    Extrai uma tabela larga (colunas=tickers) para um campo (Close, Volume, etc.)
-    de um DataFrame MultiIndex (ticker, OHLC).
-    """
-    if raw is None or raw.empty:
-        raise ValueError("DataFrame vazio (falha no download).")
-    if not isinstance(raw.columns, pd.MultiIndex):
-        # caso baixado para 1 ticker sem MI
-        if field not in raw.columns:
-            raise KeyError(f"'{field}' não encontrado.")
-        tk = getattr(raw, "name", None) or "TICKER"
-        raw = pd.concat({tk: raw}, axis=1)
-
-    if field in raw.columns.get_level_values(-1):
-        out = raw.xs(field, axis=1, level=-1)
-    elif field in raw.columns.get_level_values(0):
-        out = raw.xs(field, axis=1, level=0)
-    else:
-        raise KeyError(f"'{field}' não encontrado em nenhum nível.")
-    if out.empty:
-        raise ValueError(f"Série '{field}' vazia após extração.")
-    return out
-
 @st.cache_data(ttl=60 * 60)
 def download_prices_single(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    """
-    Versão single-ticker (mais leve), com retry e normalização de colunas.
-    """
     raw = yf_download(ticker, start=start, end=end, interval=interval)
-    if raw.empty:
-        return pd.DataFrame()
-    # retorna um DF simples com OHLCV
+    if raw.empty: return pd.DataFrame()
     if isinstance(raw.columns, pd.MultiIndex):
         try:
             out = raw[ticker].copy()
         except KeyError:
-            # se o nível estiver invertido, tente swap
             raw2 = raw.swaplevel(axis=1).sort_index(axis=1)
             out = raw2[ticker].copy()
     else:
         out = raw.copy()
     return out.dropna()
 
-@st.cache_data(ttl=24 * 60 * 60)
-def get_fast_info(ticker: str) -> dict:
-    try:
-        t = yf.Ticker(ticker)
-        info = dict(getattr(t, "fast_info", {}) or {})
-        return info
-    except Exception:
-        return {}
-
-# ======== Indicadores Técnicos ========
+# ======== Indicadores ========
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
@@ -213,8 +184,7 @@ def pct_return(series: pd.Series, n: int) -> pd.Series:
     return series.pct_change(n)
 
 def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+    if df is None or df.empty: return pd.DataFrame()
     out = df.copy()
     out["EMA20"] = ema(out["Close"], 20)
     out["EMA50"] = ema(out["Close"], 50)
@@ -223,39 +193,34 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ATR14"] = atr(out, 14)
     out["ATR%"] = (out["ATR14"] / out["Close"]) * 100
     m, s, h = macd(out["Close"])
-    out["MACD"] = m
-    out["MACDsig"] = s
-    out["MACDhist"] = h
+    out["MACD"] = m; out["MACDsig"] = s; out["MACDhist"] = h
     ma20, up, lo = bollinger(out["Close"], 20, 2)
-    out["BB_MA20"] = ma20
-    out["BB_UP"] = up
-    out["BB_LO"] = lo
+    out["BB_MA20"] = ma20; out["BB_UP"] = up; out["BB_LO"] = lo
     out["Ret5D"] = pct_return(out["Close"], 5)
     out["Ret21D"] = pct_return(out["Close"], 21)
     out["Ret63D"] = pct_return(out["Close"], 63)
     return out.dropna()
 
-# ======== Score Técnico ========
+# ======== Score / Sinal ========
 def technical_score(row, w_trend=40, w_mom=35, w_band=15, w_short=10) -> float:
     score = 0.0
-    # Tendência
     trend = 0.0
     trend += 0.6 if row["Close"] > row["EMA200"] else 0.0
     trend += 0.4 if (row["EMA20"] > row["EMA50"] > row["EMA200"]) else 0.0
     score += w_trend * min(trend, 1.0)
-    # Momentum
+
     mom = 0.0
     r = row["RSI14"]
     if 45 <= r <= 65: mom += 0.4
     if r > 65: mom += 0.6
     if row["MACD"] > row["MACDsig"]: mom += 0.4
     score += w_mom * min(mom, 1.0)
-    # Bandas / Vol
+
     bb = 0.0
     if row["BB_LO"] < row["Close"] < row["BB_UP"]: bb += 0.6
     if abs(row["Close"] - row["BB_MA20"]) / row["Close"] <= 0.03: bb += 0.4
     score += w_band * min(bb, 1.0)
-    # Curto prazo
+
     short = 0.0
     if row["Ret5D"] > 0: short += 0.5
     if row["Ret21D"] > 0: short += 0.5
@@ -267,22 +232,11 @@ def technical_score(row, w_trend=40, w_mom=35, w_band=15, w_short=10) -> float:
     return float(round(score, 2))
 
 def classify_signal(score: float) -> str:
-    if score >= 80: return "Forte Compra"
-    if score >= 60: return "Compra"
-    if score >= 40: return "Neutro"
-    if score >= 20: return "Venda"
-    return "Forte Venda"
-
-def render_badge(label: str) -> str:
-    m = {
-        "Forte Compra": "badge badge-strongbuy",
-        "Compra": "badge badge-buy",
-        "Neutro": "badge badge-neutral",
-        "Venda": "badge badge-sell",
-        "Forte Venda": "badge badge-strongsell",
-    }
-    cls = m.get(label, "badge badge-neutral")
-    return f'<span class="{cls}">{label}</span>'
+    if score >= 80: return "🟢 Forte Compra"
+    if score >= 60: return "🟩 Compra"
+    if score >= 40: return "⚪ Neutro"
+    if score >= 20: return "🟥 Venda"
+    return "🔴 Forte Venda"
 
 # ======== Predição & Backtest ========
 def make_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
@@ -329,79 +283,34 @@ def simulate_threshold(df_close: pd.Series, proba: pd.Series, th: float = 0.55):
     buyhold = (1 + ret).cumprod()
     return pd.DataFrame({"eq": eq, "buyhold": buyhold, "pos": pos, "ret": strat})
 
-# ======== Risco — position sizing ========
+# ======== Position sizing ========
 def position_size(capital: float, risk_perc: float, atr_value: float, atr_mult: float, price: float):
     risk_amt = capital * (risk_perc / 100.0)
     stop = atr_mult * atr_value
-    if stop <= 0 or price <= 0:
-        return 0, 0, 0
-    qty = math.floor(risk_amt / stop)
-    qty = max(qty, 0)
+    if stop <= 0 or price <= 0: return 0, 0, 0
+    qty = max(math.floor(risk_amt / stop), 0)
     exposure = qty * price
     return qty, stop, exposure
 
-# ======== Universos dos repositórios ========
-def _read_lines_txt(p: Path):
-    try:
-        return [x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
-    except Exception:
-        return []
-
-def _read_json_list(p: Path, key_guess=("tickers","ativos","symbols","lista","assets")):
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [str(t).strip() for t in data if str(t).strip()]
-        if isinstance(data, dict):
-            for k in key_guess:
-                if k in data and isinstance(data[k], list):
-                    return [str(t).strip() for t in data[k] if str(t).strip()]
-            out = []
-            for v in data.values():
-                if isinstance(v, list):
-                    out += [str(t).strip() for t in v if str(t).strip()]
-            return list(dict.fromkeys(out))
-    except Exception:
-        pass
-    return []
-
-def load_universes_from_repo_folder():
-    candidates = [
-        Path("ibov_tickers.txt"),
-        Path("sp500_tickers.txt"),
-        Path("assets_database.json"),
-        Path("ativos.json"),
-    ]
-    tickers = []
-    for p in candidates:
-        if p.exists():
-            if p.suffix.lower() == ".txt":
-                tickers += _read_lines_txt(p)
-            elif p.suffix.lower() == ".json":
-                tickers += _read_json_list(p)
-    tickers = [t.strip().upper() for t in tickers if t and isinstance(t, str)]
-    return list(dict.fromkeys(tickers))
-
-REPO_TICKERS = load_universes_from_repo_folder()
-
-# ======== SIDEBAR ========
+# ======== Sidebar ========
 st.sidebar.title("⚙️ Parâmetros")
 
-with st.sidebar.expander("⛏️ Universos de Ativos", expanded=True):
-    st.caption("Se houver arquivos locais (ibov_tickers.txt, sp500_tickers.txt, ativos.json, assets_database.json), carrego automaticamente.")
-    default_br = ["PETR4.SA","VALE3.SA","ITUB4.SA","BBDC4.SA","BBAS3.SA","ABEV3.SA","WEGE3.SA","SUZB3.SA","B3SA3.SA","GGBR4.SA"]
-    default_us = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"]
-    default_cr = ["BTC-USD","ETH-USD","SOL-USD"]
-
-    if REPO_TICKERS:
-        st.success(f"Foram encontrados {len(REPO_TICKERS)} tickers em arquivos locais.")
-        blist = st.text_area("Lista geral detectada", value=",".join(REPO_TICKERS), height=100)
-        user_list = [t.strip() for t in blist.split(",") if t.strip()]
-        colb, colu, colc = st.columns(3)
-        with colb: st.caption("Sugestões BR"); st.code(", ".join(default_br), language="text")
-        with colu: st.caption("Sugestões US"); st.code(", ".join(default_us), language="text")
-        with colc: st.caption("Sugestões Cripto"); st.code(", ".join(default_cr), language="text")
+with st.sidebar.expander("⛏️ Universo de Ativos", expanded=True):
+    use_bank = st.checkbox("Usar Banco de Ativos (aba 📚)", value=True, key="use_bank")
+    if use_bank:
+        if not st.session_state.asset_bank:
+            st.info("Banco vazio. Vá na aba 📚 Banco de Ativos para adicionar tickers.")
+        selected = st.multiselect(
+            "Selecione os ativos para este estudo",
+            options=st.session_state.asset_bank,
+            default=st.session_state.asset_bank[:30],
+            key="bank_select"
+        )
+        user_list = selected
     else:
+        default_br = ["PETR4.SA","VALE3.SA","ITUB4.SA","BBDC4.SA","BBAS3.SA"]
+        default_us = ["AAPL","MSFT","NVDA","AMZN","GOOGL"]
+        default_cr = ["BTC-USD","ETH-USD","SOL-USD"]
         br = st.text_area("Brasil (.SA)", value=",".join(default_br), key="txt_br")
         us = st.text_area("USA", value=",".join(default_us), key="txt_us")
         cr = st.text_area("Cripto (USD)", value=",".join(default_cr), key="txt_cr")
@@ -409,8 +318,7 @@ with st.sidebar.expander("⛏️ Universos de Ativos", expanded=True):
         for block in [br, us, cr]:
             user_list += [t.strip() for t in block.split(",") if t.strip()]
 
-    limit_n = st.slider("Limite de ativos (screener)", 5, 120, 30, 5,
-                        help="Para evitar travamentos no Streamlit Cloud.", key="limite_screener")
+    limit_n = st.slider("Limite de ativos (screener)", 5, 200, min(30, max(10, len(user_list) or 30)), 5, key="limite_screener")
 
 with st.sidebar.expander("⏱️ Janela & Intervalo", expanded=False):
     start = st.date_input("Início", value=DEFAULT_START, key="date_start")
@@ -430,7 +338,7 @@ with st.sidebar.expander("🎛️ Pesos do Score (avançado)", expanded=False):
     w_short = st.slider("Peso Curto Prazo", 0, 100, 10, 5, key="w_short")
 
 with st.sidebar.expander("🧠 Predição (experimental)", expanded=False):
-    enable_pred = st.checkbox("Ativar predição (Análise/Backtest)", value=True, key="pred_enable")
+    enable_pred = st.checkbox("Ativar predição", value=True, key="pred_enable")
     thr = st.slider("Threshold compra (prob. de alta)", 0.50, 0.70, 0.55, 0.01, key="pred_thr")
 
 with st.sidebar.expander("💼 Risco", expanded=False):
@@ -438,26 +346,27 @@ with st.sidebar.expander("💼 Risco", expanded=False):
     risk_perc = st.slider("Risco por trade (%)", 0.1, 5.0, 1.0, 0.1, key="risk_pct")
     atr_mult = st.slider("Stop = ATR x", 0.5, 5.0, 2.0, 0.5, key="risk_atr_mult")
 
-st.sidebar.caption("Dica: reduza o limite de ativos se a execução ficar lenta.")
+st.sidebar.caption("Dica: limite os ativos para evitar lentidão.")
 
 # ======== Título & Tabs ========
 st.title("🧭 Super Screener + Predição + Carteira (Yahoo Finance)")
-st.caption("Unindo ideias dos seus projetos — Screener • Análise • Probabilidades • Carteira & Risco — com visual moderno.")
+st.caption("Screener • Análise • Probabilidades • Carteira & Risco • Banco de Ativos (CRUD).")
 
 tabs = st.tabs([
     "📊 Screener",
     "📈 Análise do Ativo",
     "🤖 Predição & Backtest",
     "💼 Carteira & Risco",
-    "🗂️ Listas / Importação"
+    "🗂️ Importação",
+    "📚 Banco de Ativos"
 ])
 
 # ======== 1) Screener ========
 with tabs[0]:
     st.subheader("📊 Screener")
-    tickers = user_list[:limit_n]
+    tickers = (user_list or [])[:limit_n]
     if len(tickers) == 0:
-        st.info("Adicione tickers na barra lateral.")
+        st.info("Selecione/adicione ativos na sidebar ou no Banco de Ativos.")
         st.stop()
 
     progress = st.progress(0, text="Baixando dados…")
@@ -466,11 +375,9 @@ with tabs[0]:
         progress.progress(i / len(tickers), text=f"{t} ({i}/{len(tickers)})")
         try:
             df = download_prices_single(t, str(start), str(end), interval)
-            if df.empty or len(df) < 60:
-                continue
+            if df.empty or len(df) < 60: continue
             ind = build_indicators(df)
-            if ind.empty:
-                continue
+            if ind.empty: continue
             last = ind.iloc[-1]
             sc = technical_score(last, w_trend, w_mom, w_band, w_short)
             sig = classify_signal(sc)
@@ -510,40 +417,33 @@ with tabs[0]:
 
     df_flt = df_scr.loc[mask].copy()
 
-    # Badge HTML
-    df_show = df_flt.copy()
-    df_show["Sinal"] = df_show["Sinal"].apply(render_badge)
-
+    # Exibição (sem HTML no Sinal)
     st.dataframe(
-        df_show,
+        df_flt,
         hide_index=True,
         use_container_width=True,
         column_config={
             "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
-            "Sinal": st.column_config.Column("Sinal", help="Classificação baseada no Score"),
             "EMA Hierarquia?": st.column_config.CheckboxColumn("EMA20>EMA50>EMA200"),
         }
     )
 
     # Export CSV
-    csv = df_flt.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Baixar CSV filtrado", csv, "screener.csv", "text/csv")
+    st.download_button("⬇️ Baixar CSV filtrado", df_flt.to_csv(index=False).encode("utf-8"),
+                       "screener.csv", "text/csv")
 
 # ======== 2) Análise do Ativo ========
 with tabs[1]:
     st.subheader("📈 Análise do Ativo")
-    chosen = st.selectbox("Escolha o ativo", options=user_list, index=0, key="chosen_asset")
+    chosen = st.selectbox("Escolha o ativo", options=(user_list or ["AAPL"]), index=0, key="chosen_asset")
     df = download_prices_single(chosen, str(start), str(end), interval)
     if df.empty:
-        st.warning("Sem dados para o ativo/período.")
-        st.stop()
+        st.warning("Sem dados para o ativo/período."); st.stop()
     ind = build_indicators(df)
     if ind.empty:
-        st.warning("Não foi possível calcular indicadores para o período.")
-        st.stop()
+        st.warning("Não foi possível calcular indicadores."); st.stop()
     last = ind.iloc[-1]
 
-    # Métricas rápidas
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("Preço", f"{last['Close']:.2f}")
     with c2: st.metric("RSI(14)", f"{last['RSI14']:.1f}")
@@ -552,42 +452,29 @@ with tabs[1]:
         sc = technical_score(last, w_trend, w_mom, w_band, w_short)
         st.metric("Score Técnico", f"{sc:.0f} / 100")
 
-    # Gráfico principal
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=ind.index, open=ind["Open"], high=ind["High"], low=ind["Low"], close=ind["Close"],
-        name="Candles", opacity=0.85
-    ))
-    fig.add_trace(go.Scatter(x=ind.index, y=ind["EMA20"], name="EMA20"))
-    fig.add_trace(go.Scatter(x=ind.index, y=ind["EMA50"], name="EMA50"))
-    fig.add_trace(go.Scatter(x=ind.index, y=ind["EMA200"], name="EMA200"))
-    fig.add_trace(go.Scatter(x=ind.index, y=ind["BB_UP"], name="BB_UP", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=ind.index, y=ind["BB_MA20"], name="BB_MA20", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=ind.index, y=ind["BB_LO"], name="BB_LO", line=dict(dash="dot")))
-    fig.update_layout(
-        height=620,
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_rangeslider_visible=False,
-        xaxis_rangebreaks=[dict(bounds=["sat", "mon"])],
-    )
+    fig.add_trace(go.Candlestick(x=ind.index, open=ind["Open"], high=ind["High"], low=ind["Low"], close=ind["Close"], name="Candles", opacity=0.85))
+    for col in ["EMA20","EMA50","EMA200","BB_UP","BB_MA20","BB_LO"]:
+        dash = "dot" if col.startswith("BB_") else None
+        fig.add_trace(go.Scatter(x=ind.index, y=ind[col], name=col, line=dict(dash=dash) if dash else None))
+    fig.update_layout(height=620, margin=dict(l=0, r=0, t=10, b=0), xaxis_rangeslider_visible=False,
+                      xaxis_rangebreaks=[dict(bounds=["sat","mon"])])
     st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
-    # Diagnóstico textual + Predição (opcional)
     colA, colB = st.columns([1.3, 1.0], gap="large")
     with colA:
-        sinal = classify_signal(sc)
         st.markdown("#### Diagnóstico")
         bullets = [
-            f"**Sinal**: {render_badge(sinal)}",
+            f"**Sinal**: {classify_signal(sc)}",
             f"**EMAs**: {'EMA20>EMA50>EMA200 ✅' if (last['EMA20']>last['EMA50']>last['EMA200']) else 'Desalinhadas ⚠️'}",
             f"**MACD**: {'Acima da linha de sinal ✅' if last['MACD']>last['MACDsig'] else 'Abaixo ⚠️'}",
             f"**Retornos**: 5D {last['Ret5D']*100:.1f}%, 21D {last['Ret21D']*100:.1f}%, 63D {last['Ret63D']*100:.1f}%",
         ]
-        st.write("\n".join([f"- {b}" for b in bullets]), unsafe_allow_html=True)
+        st.write("\n".join([f"- {b}" for b in bullets]))
 
     with colB:
         if enable_pred and SKLEARN_OK:
-            with st.spinner("Treinando predição (logística, walk-forward)…"):
+            with st.spinner("Predição (logística, walk-forward)…"):
                 X, y = make_features(ind)
                 if len(X) > 200 and len(np.unique(y.dropna())) == 2:
                     proba, auc = walk_forward_logit(X, y, splits=5)
@@ -595,27 +482,26 @@ with tabs[1]:
                     st.metric("Prob. de alta (D+1)", f"{last_p*100:0.1f}%")
                     st.caption(f"AUC média (WF): {auc:0.3f}  •  (≈0.5 é aleatório)")
                 else:
-                    st.info("Amostra curta para predição robusta (≥200 barras).")
+                    st.info("Amostra curta para predição (≥200 barras).")
         elif enable_pred and not SKLEARN_OK:
-            st.info("Instale scikit-learn (veja requirements.txt) para habilitar a predição.")
+            st.info("Instale scikit-learn (veja requirements.txt).")
 
 # ======== 3) Predição & Backtest ========
 with tabs[2]:
     st.subheader("🤖 Predição & Backtest (didático)")
-    chosen2 = st.selectbox("Ativo para predição", options=user_list, index=0, key="pred_asset")
+    chosen2 = st.selectbox("Ativo para predição", options=(user_list or ["AAPL"]), index=0, key="pred_asset")
     df2 = download_prices_single(chosen2, str(start), str(end), interval)
     if df2.empty:
-        st.warning("Sem dados para o ativo/período.")
-        st.stop()
+        st.warning("Sem dados para o ativo/período."); st.stop()
     ind2 = build_indicators(df2)
     if ind2.empty:
-        st.warning("Não foi possível calcular indicadores para o período.")
+        st.warning("Não foi possível calcular indicadores.")
     elif not SKLEARN_OK:
         st.info("Instale scikit-learn para usar esta aba.")
     else:
         X2, y2 = make_features(ind2)
         if len(X2) < 200 or len(np.unique(y2.dropna())) < 2:
-            st.warning("Amostra insuficiente para walk-forward (≥200 barras e alvo variado).")
+            st.warning("Amostra insuficiente (≥200 barras e alvo variado).")
         else:
             with st.spinner("Treinando e simulando…"):
                 proba2, auc2 = walk_forward_logit(X2, y2, splits=5)
@@ -626,42 +512,36 @@ with tabs[2]:
                 with c3:
                     dd = (sim["eq"] / sim["eq"].cummax() - 1).min()
                     st.metric("Max Drawdown", f"{dd*100:0.2f}%")
-
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(x=sim.index, y=sim["eq"], name="Estratégia (Eq)"))
                 fig2.add_trace(go.Scatter(x=sim.index, y=sim["buyhold"], name="Buy&Hold"))
                 fig2.update_layout(height=420, margin=dict(l=0, r=0, t=10, b=0))
                 st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
-            st.caption("⚠️ Predição didática, sujeita a overfitting. Use como estudo, não como recomendação.")
+            st.caption("⚠️ Predição didática, sujeita a overfitting. Use como estudo.")
 
-# ======== 4) Carteira & Risco ========
+# ======== 4) Carteira & Risco (com edição) ========
 with tabs[3]:
-    st.subheader("💼 Carteira & Risco (ATR sizing)")
+    st.subheader("💼 Carteira & Risco (com edição manual)")
 
-    # Base para carteira: se vier do Screener usa df_flt; se não, calcula rápida
-    if "df_flt" in locals() and isinstance(df_flt, pd.DataFrame) and not df_flt.empty:
+    # Base automática a partir do Screener (se tiver) senão monta rápido
+    if 'df_flt' in locals() and isinstance(df_flt, pd.DataFrame) and not df_flt.empty:
         base = df_flt[["Ticker","Close","RSI14","ATR%","Score","Sinal"]].copy()
     else:
         base_rows = []
         prog2 = st.progress(0, text="Montando base…")
-        for i, t in enumerate(user_list[:limit_n], start=1):
-            prog2.progress(i/len(user_list[:limit_n]), text=f"{t} ({i}/{len(user_list[:limit_n])})")
+        base_tickers = (user_list or [])[:min(limit_n, len(user_list or []))]
+        for i, t in enumerate(base_tickers, start=1):
+            prog2.progress(i/len(base_tickers), text=f"{t} ({i}/{len(base_tickers)})")
             try:
                 dfb = download_prices_single(t, str(start), str(end), interval)
-                if dfb.empty or len(dfb) < 60:
-                    continue
+                if dfb.empty or len(dfb) < 60: continue
                 indb = build_indicators(dfb)
-                if indb.empty:
-                    continue
+                if indb.empty: continue
                 lastb = indb.iloc[-1]
                 scb = technical_score(lastb, w_trend, w_mom, w_band, w_short)
                 base_rows.append({
-                    "Ticker": t,
-                    "Close": float(lastb["Close"]),
-                    "RSI14": float(lastb["RSI14"]),
-                    "ATR%": float(lastb["ATR%"]),
-                    "Score": scb,
-                    "Sinal": classify_signal(scb),
+                    "Ticker": t, "Close": float(lastb["Close"]), "RSI14": float(lastb["RSI14"]),
+                    "ATR%": float(lastb["ATR%"]), "Score": scb, "Sinal": classify_signal(scb),
                 })
             except Exception as e:
                 print(f"[WARN] {t}: {e}")
@@ -669,27 +549,86 @@ with tabs[3]:
         base = pd.DataFrame(base_rows)
 
     if base.empty:
-        st.info("Sem base para sugerir carteira. Rode o Screener na aba 1 ou verifique seus tickers.")
+        st.info("Sem base. Rode o Screener ou selecione ativos na sidebar.")
     else:
         st.markdown("#### Base de seleção")
         st.dataframe(base.reset_index(drop=True), hide_index=True, use_container_width=True)
 
-        method = st.radio("Método de pesos", ["Equal-weight", "Inverso ao ATR"], horizontal=True, key="peso_method")
+        st.markdown("#### Construção da Carteira")
+        mode = st.radio("Modo de pesos", ["Equal-weight", "Inverso ao ATR", "📝 Manual (editar)"], horizontal=True, key="peso_mode")
+
+        # gera proposta inicial
         n_top = st.slider("Qtd. de ativos (top por Score)", 3, min(25, len(base)), min(10, len(base)), key="peso_n_top")
         picks = base.sort_values("Score", ascending=False).head(n_top).copy()
 
-        if method == "Inverso ao ATR":
+        if mode == "Inverso ao ATR":
             w = 1 / picks["ATR%"].replace(0, np.nan)
             w = w.replace([np.inf, -np.inf], np.nan).fillna(w.mean() if w.notna().any() else 1.0)
             picks["Peso"] = w / w.sum() if w.sum() > 0 else 1.0 / len(picks)
-        else:
+        elif mode == "Equal-weight":
             picks["Peso"] = 1.0 / len(picks)
+        else:  # Manual
+            # se já existe carteira na sessão, parte dela; senão cria com equal-weight
+            if not st.session_state.portfolio.empty:
+                picks = picks.merge(st.session_state.portfolio, on="Ticker", how="left", suffixes=("","_old"))
+                picks["Peso"] = picks["Peso"].fillna(1.0/len(picks))
+            else:
+                picks["Peso"] = 1.0/len(picks)
+
+        # editor manual quando modo Manual
+        if mode == "📝 Manual (editar)":
+            editor_cols = ["Ticker","Peso"]
+            editable = picks[editor_cols].copy()
+            editable["Peso"] = (editable["Peso"]*100).round(2)  # % para edição
+            st.write("Edite 'Peso (%)' e use 'Adicionar linha' para incluir ativos.")
+            edited = st.data_editor(
+                editable.rename(columns={"Peso":"Peso (%)"}),
+                num_rows="dynamic", use_container_width=True, key="editor_port",
+                column_config={"Ticker": st.column_config.TextColumn(help="Ticker Yahoo"),
+                               "Peso (%)": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=0.1)}
+            )
+            # normaliza pesos
+            pesos = pd.to_numeric(edited["Peso (%)"], errors="coerce").fillna(0.0) / 100.0
+            tickz = edited["Ticker"].astype(str).str.upper().str.strip()
+            edited_df = pd.DataFrame({"Ticker": tickz, "Peso": pesos})
+            edited_df = edited_df[tickz.ne("") & pesos.gt(0)]
+            soma = edited_df["Peso"].sum()
+            if soma <= 0:
+                st.error("Pesos zerados. Ajuste os valores.")
+                st.stop()
+            edited_df["Peso"] = edited_df["Peso"] / soma  # normaliza para 1
+            st.session_state.portfolio = edited_df.copy()
+            picks = picks.merge(edited_df, on="Ticker", how="right", suffixes=("","_new"))
+            picks["Peso"] = picks["Peso"].fillna(picks.pop("Peso_new"))
+
+            # salvar/abrir carteira
+            colb1, colb2 = st.columns([1,1])
+            with colb1:
+                if st.button("💾 Salvar carteira (carteira.json)", key="save_port"):
+                    PORTFOLIO_FILE.write_text(picks[["Ticker","Peso"]].to_json(orient="records", indent=2), encoding="utf-8")
+                    st.success("Carteira salva em carteira.json")
+            with colb2:
+                if st.button("📂 Abrir carteira (carteira.json)", key="load_port"):
+                    if PORTFOLIO_FILE.exists():
+                        try:
+                            data = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
+                            dfp = pd.DataFrame(data)
+                            if {"Ticker","Peso"}.issubset(dfp.columns):
+                                dfp["Ticker"] = dfp["Ticker"].astype(str).str.upper().str.strip()
+                                dfp["Peso"] = pd.to_numeric(dfp["Peso"], errors="coerce").fillna(0.0)
+                                s = dfp["Peso"].sum()
+                                if s > 0: dfp["Peso"] /= s
+                                st.session_state.portfolio = dfp[["Ticker","Peso"]].copy()
+                                st.success("Carteira carregada.")
+                            else:
+                                st.error("Formato inválido em carteira.json")
+                        except Exception as e:
+                            st.error(f"Erro ao ler carteira.json: {e}")
 
         picks["Alocado"] = picks["Peso"] * capital
 
         c1, c2 = st.columns([1.5, 1.0], gap="large")
         with c1:
-            st.markdown("#### Sugestão de Alocação")
             view = picks[["Ticker","Close","ATR%","Score","Sinal","Peso","Alocado"]].copy()
             view["Peso (%)"] = (view["Peso"]*100).round(2)
             st.dataframe(view.drop(columns=["Peso"]), use_container_width=True, hide_index=True)
@@ -703,37 +642,83 @@ with tabs[3]:
         df_pos = download_prices_single(choose_risk, str(start), str(end), interval)
         ind_pos = build_indicators(df_pos)
         last_pos = ind_pos.iloc[-1]
-        qty, stop_abs, exposure = position_size(
-            capital=capital,
-            risk_perc=risk_perc,
-            atr_value=float(last_pos["ATR14"]),
-            atr_mult=atr_mult,
-            price=float(last_pos["Close"]),
-        )
+        qty, stop_abs, exposure = position_size(capital, risk_perc, float(last_pos["ATR14"]), atr_mult, float(last_pos["Close"]))
         st.write(
             f"- Preço: **{last_pos['Close']:.2f}**  •  ATR(14): **{last_pos['ATR14']:.2f}**  →  Stop = **{atr_mult}×ATR = {stop_abs:.2f}**  \n"
             f"- Risco/trade: **{risk_perc:.1f}%**  →  Quantidade: **{qty}**  •  Exposição: **{exposure:,.2f}**"
         )
 
-# ======== 5) Listas / Importação ========
+# ======== 5) Importação / Exportação ========
 with tabs[4]:
-    st.subheader("🗂️ Listas de Ativos")
-    st.write("Baixe a lista atual, edite e reenvie. Ou cole manualmente na sidebar.")
+    st.subheader("🗂️ Importação / Exportação")
+    # Lista corrente (estudo) — download
     current = pd.DataFrame({"ticker": user_list})
     st.download_button("⬇️ Baixar lista atual (CSV)", data=current.to_csv(index=False).encode("utf-8"),
-                       file_name="lista_tickers.csv", mime="text/csv")
+                       file_name="lista_tickers.csv", mime="text/csv", key="dl_list")
 
-    up = st.file_uploader("Subir CSV com coluna 'ticker'", type=["csv"], key="uploader_csv")
+    up = st.file_uploader("Subir CSV com coluna 'ticker' (para usar na sessão — não altera banco)", type=["csv"], key="uploader_csv")
     if up is not None:
         try:
             df_up = pd.read_csv(up)
             if "ticker" in df_up.columns:
-                new_list = df_up["ticker"].astype(str).str.strip().tolist()
-                st.success(f"Carregado {len(new_list)} tickers. Copie-os para a barra lateral para usar.")
+                new_list = df_up["ticker"].astype(str).str.strip().str.upper().tolist()
+                st.success(f"Carregado {len(new_list)} tickers para a sessão. Selecione-os na sidebar.")
                 st.dataframe(df_up.head(), use_container_width=True)
             else:
                 st.error("CSV precisa conter a coluna 'ticker'.")
         except Exception as e:
             st.error(f"Erro ao ler CSV: {e}")
+
+# ======== 6) Banco de Ativos (CRUD) ========
+with tabs[5]:
+    st.subheader("📚 Banco de Ativos (CRUD)")
+    st.caption("Gerencie o **banco mestre** de tickers usado pelo app. Salva em `ativos.json` (persistente no disco do app).")
+
+    # Editor
+    bank_df = pd.DataFrame({"Ticker": st.session_state.asset_bank})
+    bank_df = bank_df.sort_values("Ticker").reset_index(drop=True)
+
+    edited_bank = st.data_editor(
+        bank_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="editor_bank",
+        column_config={"Ticker": st.column_config.TextColumn(help="Ticker Yahoo (ex.: PETR4.SA, AAPL, BTC-USD)")}
+    )
+
+    # Limpa/normaliza
+    clean_list = (edited_bank["Ticker"]
+                  .astype(str)
+                  .str.upper()
+                  .str.strip())
+    clean_list = [t for t in clean_list if t]
+    clean_list = list(dict.fromkeys(clean_list))  # sem duplicatas
+
+    colbk1, colbk2, colbk3, colbk4 = st.columns([1,1,1,1])
+    with colbk1:
+        if st.button("💾 Salvar banco (ativos.json)", key="save_bank"):
+            save_asset_bank(clean_list)
+            st.session_state.asset_bank = load_asset_bank()
+            st.success(f"Banco salvo com {len(st.session_state.asset_bank)} tickers.")
+    with colbk2:
+        if st.button("📂 Recarregar banco", key="reload_bank"):
+            st.session_state.asset_bank = load_asset_bank()
+            st.success("Banco recarregado.")
+    with colbk3:
+        if st.button("⬇️ Exportar banco (JSON)", key="export_bank"):
+            st.download_button(
+                "Clique para baixar", data=json.dumps({"tickers": clean_list}, ensure_ascii=False, indent=2),
+                file_name="ativos.json", mime="application/json", key="inline_dl_bank")
+    with colbk4:
+        upb = st.file_uploader("Importar banco (JSON)", type=["json"], key="import_bank")
+        if upb is not None:
+            try:
+                data = json.load(upb)
+                lst = data if isinstance(data, list) else data.get("tickers") or data.get("ativos") or []
+                lst = [str(t).strip().upper() for t in lst if str(t).strip()]
+                st.session_state.asset_bank = list(dict.fromkeys(lst))
+                st.success(f"Banco importado ({len(lst)} tickers). Clique em **Salvar banco** para persistir.")
+            except Exception as e:
+                st.error(f"Erro ao importar JSON: {e}")
 
 st.caption("© Para estudo. Sem recomendação de investimento.")
