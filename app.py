@@ -360,18 +360,33 @@ with tabs[0]:
         progress.empty()
         if rows:
             df_out = pd.DataFrame(rows)
-            # escore de ordenação: 70% score + 30*Prob↑
-            def safe_num(x): 
-                try: return float(x)
-                except: return np.nan
-            df_out["Score"] = df_out["Score"].apply(safe_num)
-            df_out["Prob↑"] = df_out["Prob↑"].apply(safe_num)
-            df_out["_ord"] = 0.7*df_out["Score"] + 30.0*df_out["Prob↑"]
-            df_out = df_out.sort_values(by="_ord", ascending=False).drop(columns=["_ord"])
+
+            # Converte colunas numéricas com segurança, mesmo se não existirem
+            n = len(df_out)
+            def to_num(col):
+                series = df_out.get(col, pd.Series([np.nan]*n))
+                return pd.to_numeric(series, errors="coerce")
+
+            df_out["Score"] = to_num("Score")
+            df_out["Prob↑"] = to_num("Prob↑")
+
+            # Só cria a ordenação se houver ao menos um valor numérico
+            if df_out["Score"].notna().any() or df_out["Prob↑"].notna().any():
+                df_out["_ord"] = 0.7*df_out["Score"].fillna(0) + 30.0*df_out["Prob↑"].fillna(0)
+                df_out = df_out.sort_values(by="_ord", ascending=False).drop(columns=["_ord"], errors="ignore")
+
             st.dataframe(df_out, use_container_width=True, hide_index=True)
-            st.download_button("⬇️ Baixar resultados (CSV)", data=df_out.to_csv(index=False).encode("utf-8"),
-                               file_name=f"screener_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                               mime="text/csv")
+
+            # Exporta o CSV mesmo se faltarem colunas
+            st.download_button(
+                "⬇️ Baixar resultados (CSV)",
+                data=df_out.to_csv(index=False).encode("utf-8"),
+                file_name=f"screener_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("Nenhuma linha foi gerada. Tente novamente com outros tickers ou período.")
+
 
 # ==============================
 # TAB 2 — Detalhe do Ativo
