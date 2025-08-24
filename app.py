@@ -66,16 +66,17 @@ if "portfolio" not in st.session_state:
     st.session_state.portfolio = pd.DataFrame(columns=["Ticker","Peso"])
 
 # =============== Banco de ativos (persistência) ===============
-def load_asset_bank() -> List[str]:
+def load_asset_bank() -> list[str]:
     """
     Lê o banco mestre de ativos de:
-      - ativos.json  -> {"tickers":[...]}  OU  lista direta [...]
+      - ativos.json  -> {"tickers":[...]} OU lista direta [...]
       - assets_database.json -> {"acoes_br":[...], "acoes_us":[...], "etfs":[...], "indices":[...],
                                  "fx":[...], "cripto":[...], "futuros":[...], "custom":[...]}
-    Retorna lista única, upper(), sem vazios.
+    Retorna lista única, em UPPERCASE, sem vazios.
     """
     candidates = [ASSET_BANK_FILE, Path("assets_database.json")]
     category_keys = ["acoes_br", "acoes_us", "etfs", "indices", "fx", "cripto", "futuros", "custom", "ativos", "assets"]
+
     for p in candidates:
         if not p.exists():
             continue
@@ -84,11 +85,11 @@ def load_asset_bank() -> List[str]:
         except Exception:
             continue
 
-        tickers: List[str] = []
+        tickers: list[str] = []
         if isinstance(data, list):
             tickers = data
         elif isinstance(data, dict):
-            if "tickers" in data and isinstance(data["tickers"], list):
+            if isinstance(data.get("tickers"), list):
                 tickers = data["tickers"]
             else:
                 for k in category_keys:
@@ -98,10 +99,38 @@ def load_asset_bank() -> List[str]:
 
         tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
         if tickers:
-            # remove duplicatas preservando ordem
-            return list(dict.fromkeys(tickers))
+            return list(dict.fromkeys(tickers))  # remove duplicatas preservando ordem
 
     return []
+
+def save_asset_bank(tickers: list[str], path: Path | None = None) -> None:
+    """
+    Salva o banco no formato simples {"tickers":[...]} em ativos.json (padrão) ou no path indicado.
+    """
+    p = path or ASSET_BANK_FILE
+    lst = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    lst = list(dict.fromkeys(lst))
+    payload = {"tickers": lst}
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except Exception:
+        return 0.0
+
+if "bank_mtime" not in st.session_state:
+    st.session_state.bank_mtime = 0.0
+if "asset_bank" not in st.session_state:
+    st.session_state.asset_bank = []
+
+# Se o arquivo mudou (ou se a sessão ainda não tem banco), recarrega
+file_mtime = _mtime(ASSET_BANK_FILE) or _mtime(Path("assets_database.json"))
+if (not st.session_state.asset_bank) or (file_mtime and file_mtime != st.session_state.bank_mtime):
+    st.session_state.asset_bank = load_asset_bank()
+    st.session_state.bank_mtime = file_mtime
+
+
 
 # =============== Yahoo robusto ===============
 @st.cache_data(ttl=60 * 60)
@@ -744,6 +773,7 @@ with tabs[5]:
     with colbk2:
         if st.button("📂 Recarregar banco", key="reload_bank"):
             st.session_state.asset_bank = load_asset_bank()
+            st.session_state.bank_mtime = _mtime(ASSET_BANK_FILE) or _mtime(Path("assets_database.json"))
             st.success("Banco recarregado.")
             st.rerun()
     with colbk3:
