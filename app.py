@@ -1,945 +1,740 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import warnings
+# app.py
+# -*- coding: utf-8 -*-
+# Super Screener + Predição + Carteira — Visual Moderno — Yahoo Finance
+
+import os
+import io
+import json
+import math
+import time
 from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
-import ta
-from scipy import stats
-import requests
 
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-# Configuração da página
+# ======== Imports opcionais (predição) ========
+SKLEARN_OK = True
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import TimeSeriesSplit
+except Exception:
+    SKLEARN_OK = False
+
+# =========================
+# Config Global
+# =========================
 st.set_page_config(
-    page_title="Sistema Financeiro Completo",
+    page_title="Cacau — Super Screener + Predição + Carteira",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# CSS personalizado
+# =========================
+# Estilo (CSS) — Visual Moderno
+# =========================
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 3rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-        font-weight: bold;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-        margin: 0.5rem 0;
-    }
-    .sidebar .sidebar-content {
-        background-color: #f8f9fa;
-    }
-    .stAlert > div {
-        padding: 0.5rem;
-        border-radius: 0.25rem;
-    }
+/* Fonte limpa e cards com sombra suave */
+html, body, [class*="css"]  {
+  font-family: "Inter", system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+div.block-container{padding-top:1.2rem; padding-bottom:2rem;}
+/* Métricas com look cartão */
+[data-testid="stMetricValue"] {
+  font-size: 1.4rem;
+}
+[data-testid="stMetric"] {
+  background: #0f172a0a;
+  border: 1px solid #e2e8f0;
+  padding: 14px 12px;
+  border-radius: 16px;
+  box-shadow: 0 2px 14px rgba(2,6,23,0.04);
+}
+/* Botões */
+.stButton>button {
+  border-radius: 12px;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid #e2e8f0;
+}
+/* Badges simples */
+.badge {
+  display:inline-block;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.badge-buy { background:#dcfce7; color:#166534; border: 1px solid #86efac;}
+.badge-strongbuy { background:#bbf7d0; color:#14532d; border: 1px solid #4ade80;}
+.badge-sell { background:#fee2e2; color:#7f1d1d; border: 1px solid #fca5a5;}
+.badge-strongsell { background:#fecaca; color:#7f1d1d; border: 1px solid #f87171;}
+.badge-neutral { background:#e2e8f0; color:#0f172a; border: 1px solid #cbd5e1;}
+/* Tabela mais compacta */
+[data-testid="stDataFrame"] div[role="table"] { font-size: 0.95rem; }
 </style>
 """, unsafe_allow_html=True)
 
-class FinancialAnalyzer:
-    def __init__(self):
-        self.data = None
-        self.ticker = None
-    
-    @st.cache_data(ttl=1800)  # Cache por 30 minutos
-    def get_stock_data(_self, ticker, period="1y"):
-        """Obtém dados da ação do Yahoo Finance com cache"""
-        try:
-            stock = yf.Ticker(ticker)
-            data = stock.history(period=period)
-            info = stock.info
-            return data, info
-        except Exception as e:
-            st.error(f"Erro ao obter dados para {ticker}: {e}")
-            return None, None
-    
-    @st.cache_data(ttl=3600)  # Cache por 1 hora
-    def get_multiple_tickers(_self, tickers, period="6mo"):
-        """Obtém dados de múltiplos tickers"""
-        try:
-            data = yf.download(tickers, period=period, group_by='ticker', progress=False)
-            return data
-        except Exception as e:
-            st.error(f"Erro ao obter dados múltiplos: {e}")
-            return None
-    
-    def calculate_technical_indicators(self, data):
-        """Calcula indicadores técnicos usando a biblioteca ta"""
-        if data is None or data.empty:
-            return data
-        
-        df = data.copy()
-        
-        # Médias Móveis
-        df['SMA_20'] = ta.trend.SMAIndicator(df['Close'], window=20).sma_indicator()
-        df['SMA_50'] = ta.trend.SMAIndicator(df['Close'], window=50).sma_indicator()
-        df['SMA_200'] = ta.trend.SMAIndicator(df['Close'], window=200).sma_indicator()
-        df['EMA_12'] = ta.trend.EMAIndicator(df['Close'], window=12).ema_indicator()
-        df['EMA_26'] = ta.trend.EMAIndicator(df['Close'], window=26).ema_indicator()
-        
-        # RSI
-        df['RSI'] = ta.momentum.RSIIndicator(df['Close']).rsi()
-        
-        # MACD
-        macd = ta.trend.MACD(df['Close'])
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
-        df['MACD_Histogram'] = macd.macd_diff()
-        
-        # Bollinger Bands
-        bb = ta.volatility.BollingerBands(df['Close'])
-        df['BB_Upper'] = bb.bollinger_hband()
-        df['BB_Lower'] = bb.bollinger_lband()
-        df['BB_Middle'] = bb.bollinger_mavg()
-        
-        # Stochastic
-        stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
-        df['Stoch_K'] = stoch.stoch()
-        df['Stoch_D'] = stoch.stoch_signal()
-        
-        # Volume indicators
-        df['Volume_SMA'] = ta.volume.VolumeSMAIndicator(df['Close'], df['Volume']).volume_sma()
-        
-        # Volatilidade
-        df['ATR'] = ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range()
-        
-        return df
-    
-    def predict_prices(self, data, days_ahead=30):
-        """Sistema de previsão com múltiplos modelos"""
-        if data is None or len(data) < 100:
-            return None, None, None
-        
-        # Preparar features
-        df = self.calculate_technical_indicators(data)
-        
-        # Features para o modelo
-        feature_columns = ['Open', 'High', 'Low', 'Volume', 'RSI', 'MACD', 
-                          'SMA_20', 'SMA_50', 'EMA_12', 'ATR']
-        
-        # Remover NaN e preparar dados
-        df_clean = df[feature_columns + ['Close']].dropna()
-        
-        if len(df_clean) < 50:
-            return None, None, None
-        
-        X = df_clean[feature_columns]
-        y = df_clean['Close']
-        
-        # Split dos dados (80% treino, 20% teste)
-        split_idx = int(len(X) * 0.8)
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
-        
-        # Normalização
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # Modelos
-        models = {
-            'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
-            'Linear Regression': LinearRegression()
-        }
-        
-        predictions = {}
-        metrics = {}
-        test_predictions = {}
-        
-        for name, model in models.items():
-            # Treinamento
-            model.fit(X_train_scaled, y_train)
-            
-            # Predições no conjunto de teste
-            y_pred = model.predict(X_test_scaled)
-            test_predictions[name] = y_pred
-            
-            # Métricas
-            metrics[name] = {
-                'R²': r2_score(y_test, y_pred),
-                'RMSE': np.sqrt(mean_squared_error(y_test, y_pred)),
-                'MAE': mean_absolute_error(y_test, y_pred)
-            }
-            
-            # Predição futura
-            last_features = X.iloc[-1:].values
-            last_features_scaled = scaler.transform(last_features)
-            future_pred = model.predict(last_features_scaled)[0]
-            predictions[name] = future_pred
-        
-        return predictions, metrics, (y_test, test_predictions)
-    
-    def backtest_strategy(self, data, strategy='sma_crossover'):
-        """Backtest simples de estratégias"""
-        if data is None or len(data) < 100:
-            return None
-        
-        df = self.calculate_technical_indicators(data)
-        
-        if strategy == 'sma_crossover':
-            # Estratégia de cruzamento de médias móveis
-            signals = np.where(df['SMA_20'] > df['SMA_50'], 1, 0)
-            df['Position'] = signals
-            df['Returns'] = df['Close'].pct_change()
-            df['Strategy_Returns'] = df['Position'].shift(1) * df['Returns']
-            
-        elif strategy == 'rsi_oversold':
-            # Estratégia RSI oversold/overbought
-            signals = np.where(df['RSI'] < 30, 1, np.where(df['RSI'] > 70, 0, np.nan))
-            df['Position'] = pd.Series(signals).fillna(method='ffill').fillna(0)
-            df['Returns'] = df['Close'].pct_change()
-            df['Strategy_Returns'] = df['Position'].shift(1) * df['Returns']
-        
-        # Calcular métricas
-        total_return = (1 + df['Strategy_Returns']).prod() - 1
-        buy_hold_return = (df['Close'].iloc[-1] / df['Close'].iloc[0]) - 1
-        
-        return {
-            'total_return': total_return,
-            'buy_hold_return': buy_hold_return,
-            'strategy_data': df[['Close', 'Position', 'Returns', 'Strategy_Returns']].dropna()
-        }
+# =========================
+# Datas padrão
+# =========================
+TZ = "America/Sao_Paulo"
+TODAY = datetime.now().date()
+DEFAULT_START = TODAY - timedelta(days=365 * 3)
+DEFAULT_END = TODAY
 
-def create_advanced_chart(data, ticker, indicators=None):
-    """Cria gráfico avançado com indicadores técnicos"""
-    if indicators is None:
-        indicators = ['SMA_20', 'SMA_50', 'RSI', 'MACD', 'BB']
-    
-    # Determinar número de subplots
-    rows = 1
-    if 'RSI' in indicators: rows += 1
-    if 'MACD' in indicators: rows += 1
-    if 'Volume' in indicators: rows += 1
-    
-    subplot_titles = ['Preço e Indicadores']
-    if 'Volume' in indicators: subplot_titles.append('Volume')
-    if 'RSI' in indicators: subplot_titles.append('RSI')
-    if 'MACD' in indicators: subplot_titles.append('MACD')
-    
-    fig = make_subplots(
-        rows=rows,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        subplot_titles=subplot_titles,
-        row_heights=[0.6] + [0.2] * (rows - 1) if rows > 1 else [1.0]
-    )
-    
-    # Candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=data.index,
-            open=data['Open'],
-            high=data['High'],
-            low=data['Low'],
-            close=data['Close'],
-            name='Preço',
-            increasing_line_color='#26a69a',
-            decreasing_line_color='#ef5350'
-        ), row=1, col=1
-    )
-    
-    # Médias Móveis
-    if 'SMA_20' in indicators and 'SMA_20' in data.columns:
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['SMA_20'], 
-                      line=dict(color='#42a5f5', width=2), 
-                      name='SMA 20'), row=1, col=1
-        )
-    
-    if 'SMA_50' in indicators and 'SMA_50' in data.columns:
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['SMA_50'], 
-                      line=dict(color='#ab47bc', width=2), 
-                      name='SMA 50'), row=1, col=1
-        )
-    
-    # Bollinger Bands
-    if 'BB' in indicators and all(col in data.columns for col in ['BB_Upper', 'BB_Lower', 'BB_Middle']):
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['BB_Upper'], 
-                      line=dict(color='gray', dash='dash'), 
-                      name='BB Superior', opacity=0.7), row=1, col=1
-        )
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['BB_Lower'], 
-                      line=dict(color='gray', dash='dash'), 
-                      name='BB Inferior', fill='tonexty', opacity=0.3), row=1, col=1
-        )
-    
-    current_row = 2
-    
-    # Volume
-    if 'Volume' in indicators:
-        colors = ['red' if close < open else 'green' for close, open in zip(data['Close'], data['Open'])]
-        fig.add_trace(
-            go.Bar(x=data.index, y=data['Volume'], 
-                   name='Volume', marker_color=colors, opacity=0.7), 
-            row=current_row, col=1
-        )
-        current_row += 1
-    
-    # RSI
-    if 'RSI' in indicators and 'RSI' in data.columns:
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['RSI'], 
-                      line=dict(color='purple', width=2), 
-                      name='RSI'), row=current_row, col=1
-        )
-        fig.add_hline(y=70, line_dash="dash", line_color="red", 
-                     row=current_row, col=1, opacity=0.7)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", 
-                     row=current_row, col=1, opacity=0.7)
-        fig.update_yaxes(title_text="RSI", range=[0, 100], row=current_row, col=1)
-        current_row += 1
-    
-    # MACD
-    if 'MACD' in indicators and all(col in data.columns for col in ['MACD', 'MACD_Signal', 'MACD_Histogram']):
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['MACD'], 
-                      line=dict(color='blue', width=2), 
-                      name='MACD'), row=current_row, col=1
-        )
-        fig.add_trace(
-            go.Scatter(x=data.index, y=data['MACD_Signal'], 
-                      line=dict(color='orange', width=2), 
-                      name='Signal'), row=current_row, col=1
-        )
-        
-        # Histograma MACD com cores
-        colors = ['green' if val >= 0 else 'red' for val in data['MACD_Histogram']]
-        fig.add_trace(
-            go.Bar(x=data.index, y=data['MACD_Histogram'], 
-                   name='MACD Hist', marker_color=colors, opacity=0.6), 
-            row=current_row, col=1
-        )
-        fig.update_yaxes(title_text="MACD", row=current_row, col=1)
-    
-    fig.update_layout(
-        title=f'Análise Técnica Completa - {ticker}',
-        xaxis_rangeslider_visible=False,
-        height=800,
-        showlegend=True,
-        template="plotly_white"
-    )
-    
-    # Adicionar seletor de período
-    fig.update_xaxes(
-        rangeselector=dict(
-            buttons=list([
-                dict(count=1, label="1M", step="month", stepmode="backward"),
-                dict(count=3, label="3M", step="month", stepmode="backward"),
-                dict(count=6, label="6M", step="month", stepmode="backward"),
-                dict(count=1, label="1A", step="year", stepmode="backward"),
-                dict(step="all", label="Tudo")
-            ])
-        )
-    )
-    
-    return fig
+# =========================
+# Utilitários — Leitura de universos dos seus repositórios
+# =========================
+from pathlib import Path
 
-def stock_screener():
-    """Screener avançado de ações"""
-    st.subheader("🔍 Screener Avançado de Ações")
-    
-    # Listas de tickers por categoria
-    ticker_lists = {
-        'S&P 500 Top 20': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'BRK-B', 
-                          'UNH', 'JNJ', 'XOM', 'JPM', 'V', 'PG', 'MA', 'HD', 'CVX', 'ABBV', 'PFE', 'KO'],
-        'Brasileiras': ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA', 'BBDC4.SA', 'ABEV3.SA', 
-                       'MGLU3.SA', 'WEGE3.SA', 'RENT3.SA', 'LREN3.SA', 'SUZB3.SA'],
-        'Tecnologia': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'NFLX', 'ADBE', 'CRM', 'ORCL'],
-        'Personalizada': []
+def _read_lines_txt(p: Path):
+    try:
+        return [x.strip() for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+    except Exception:
+        return []
+
+def _read_json_list(p: Path, key_guess=("tickers","ativos","symbols","lista","assets")):
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(t).strip() for t in data if str(t).strip()]
+        if isinstance(data, dict):
+            # tenta chaves comuns
+            for k in key_guess:
+                if k in data and isinstance(data[k], list):
+                    return [str(t).strip() for t in data[k] if str(t).strip()]
+            # varre listas aninhadas
+            out = []
+            for v in data.values():
+                if isinstance(v, list):
+                    out += [str(t).strip() for t in v if str(t).strip()]
+            return list(dict.fromkeys(out))
+    except Exception:
+        pass
+    return []
+
+def load_universes_from_repo_folder():
+    """
+    Procura arquivos típicos usados nos seus repositórios:
+    - ibov_tickers.txt, sp500_tickers.txt (analisador_rastreador)
+    - assets_database.json (screener-01)
+    - ativos.json (screener-02)
+    Se existirem no diretório do app, agrega tudo.
+    """
+    candidates = [
+        Path("ibov_tickers.txt"),
+        Path("sp500_tickers.txt"),
+        Path("assets_database.json"),
+        Path("ativos.json"),
+    ]
+    tickers = []
+    for p in candidates:
+        if p.exists():
+            if p.suffix.lower() == ".txt":
+                tickers += _read_lines_txt(p)
+            elif p.suffix.lower() == ".json":
+                tickers += _read_json_list(p)
+    # Normaliza e deduplica
+    tickers = [t.strip().upper() for t in tickers if t and isinstance(t, str)]
+    return list(dict.fromkeys(tickers))
+
+REPO_TICKERS = load_universes_from_repo_folder()
+
+# =========================
+# Yahoo Finance — Download
+# =========================
+import yfinance as yf
+
+@st.cache_data(ttl=60 * 60)
+def download_prices(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+    """
+    Baixa OHLCV ajustado; resolve multiindex e limita janelas inválidas (ex.: 1h não pode datas muito antigas).
+    """
+    # Guard para 1h (intraday histórico limitado pelo Yahoo)
+    if interval in ("1h", "90m", "30m", "15m", "5m", "1m"):
+        start_dt = pd.to_datetime(start).date()
+        max_back = TODAY - timedelta(days=720)  # ~2 anos de histórico intradiário
+        if start_dt < max_back:
+            start = str(max_back)
+
+    df = yf.download(
+        tickers=ticker,
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(-1)
+        df = df.dropna()
+    else:
+        df = pd.DataFrame()
+    return df
+
+@st.cache_data(ttl=24 * 60 * 60)
+def get_fast_info(ticker: str) -> dict:
+    try:
+        t = yf.Ticker(ticker)
+        info = dict(getattr(t, "fast_info", {}) or {})
+        return info
+    except Exception:
+        return {}
+
+# =========================
+# Indicadores Técnicos
+# =========================
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = pd.Series(np.where(delta > 0, delta, 0.0), index=series.index)
+    down = pd.Series(np.where(delta < 0, -delta, 0.0), index=series.index)
+    roll_up = up.rolling(n).mean()
+    roll_down = down.rolling(n).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.bfill().clip(0, 100)
+
+def true_range(h, l, c_prev):
+    return pd.concat([(h - l), (h - c_prev).abs(), (l - c_prev).abs()], axis=1).max(axis=1)
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    tr = true_range(df["High"], df["Low"], df["Close"].shift(1))
+    return tr.rolling(n).mean()
+
+def macd(series: pd.Series, fast=12, slow=26, sig=9):
+    fast_ = ema(series, fast)
+    slow_ = ema(series, slow)
+    macd_line = fast_ - slow_
+    signal = ema(macd_line, sig)
+    hist = macd_line - signal
+    return macd_line, signal, hist
+
+def bollinger(series: pd.Series, n=20, k=2.0):
+    ma = series.rolling(n).mean()
+    sd = series.rolling(n).std()
+    up = ma + k * sd
+    lo = ma - k * sd
+    return ma, up, lo
+
+def pct_return(series: pd.Series, n: int) -> pd.Series:
+    return series.pct_change(n)
+
+def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["EMA20"] = ema(out["Close"], 20)
+    out["EMA50"] = ema(out["Close"], 50)
+    out["EMA200"] = ema(out["Close"], 200)
+    out["RSI14"] = rsi(out["Close"], 14)
+    out["ATR14"] = atr(out, 14)
+    out["ATR%"] = (out["ATR14"] / out["Close"]) * 100
+    m, s, h = macd(out["Close"])
+    out["MACD"] = m
+    out["MACDsig"] = s
+    out["MACDhist"] = h
+    ma20, up, lo = bollinger(out["Close"], 20, 2)
+    out["BB_MA20"] = ma20
+    out["BB_UP"] = up
+    out["BB_LO"] = lo
+    # Momentos
+    out["Ret5D"] = pct_return(out["Close"], 5)
+    out["Ret21D"] = pct_return(out["Close"], 21)
+    out["Ret63D"] = pct_return(out["Close"], 63)
+    return out.dropna()
+
+# =========================
+# Score Técnico + Classificação
+# =========================
+def technical_score(row, w_trend=40, w_mom=35, w_band=15, w_short=10) -> float:
+    score = 0.0
+    # Tendência
+    trend = 0.0
+    trend += 0.6 if row["Close"] > row["EMA200"] else 0.0
+    trend += 0.4 if (row["EMA20"] > row["EMA50"] > row["EMA200"]) else 0.0
+    score += w_trend * min(trend, 1.0)
+
+    # Momentum
+    mom = 0.0
+    r = row["RSI14"]
+    if 45 <= r <= 65:
+        mom += 0.4
+    if r > 65:
+        mom += 0.6
+    if row["MACD"] > row["MACDsig"]:
+        mom += 0.4
+    score += w_mom * min(mom, 1.0)
+
+    # Bandas / Volatilidade
+    bb = 0.0
+    if row["BB_LO"] < row["Close"] < row["BB_UP"]:
+        bb += 0.6
+    if abs(row["Close"] - row["BB_MA20"]) / row["Close"] <= 0.03:
+        bb += 0.4
+    score += w_band * min(bb, 1.0)
+
+    # Curto prazo
+    short = 0.0
+    short += 0.5 if row["Ret5D"] > 0 else 0.0
+    short += 0.5 if row["Ret21D"] > 0 else 0.0
+    score += w_short * min(short, 1.0)
+
+    # Normaliza se pesos não somarem 100
+    total_w = w_trend + w_mom + w_band + w_short
+    if total_w != 100 and total_w > 0:
+        score = score * (100 / total_w)
+
+    return float(round(score, 2))
+
+def classify_signal(score: float) -> str:
+    if score >= 80: return "Forte Compra"
+    if score >= 60: return "Compra"
+    if score >= 40: return "Neutro"
+    if score >= 20: return "Venda"
+    return "Forte Venda"
+
+def render_badge(label: str) -> str:
+    m = {
+        "Forte Compra": "badge badge-strongbuy",
+        "Compra": "badge badge-buy",
+        "Neutro": "badge badge-neutral",
+        "Venda": "badge badge-sell",
+        "Forte Venda": "badge badge-strongsell",
     }
-    
-    col1, col2, col3 = st.columns([2, 2, 2])
-    
-    with col1:
-        selected_list = st.selectbox("Selecionar Lista:", list(ticker_lists.keys()))
-        
-    with col2:
-        if selected_list == 'Personalizada':
-            custom_tickers = st.text_input("Tickers (separados por vírgula):", "AAPL,MSFT,GOOGL")
-            tickers = [t.strip().upper() for t in custom_tickers.split(',') if t.strip()]
-        else:
-            tickers = ticker_lists[selected_list]
-            st.info(f"Analisando {len(tickers)} ações da lista {selected_list}")
-    
-    with col3:
-        analysis_period = st.selectbox("Período de Análise:", ["1mo", "3mo", "6mo", "1y"], index=2)
-    
-    # Filtros
-    st.subheader("🎛️ Filtros")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        min_price = st.number_input("Preço Mínimo ($)", value=0.0, step=1.0)
-        max_price = st.number_input("Preço Máximo ($)", value=1000.0, step=10.0)
-    
-    with col2:
-        min_volume = st.number_input("Volume Mínimo", value=0, step=100000)
-        min_market_cap = st.number_input("Market Cap Mínimo (B)", value=0.0, step=1.0)
-    
-    with col3:
-        max_pe = st.number_input("P/E Máximo", value=50.0, step=5.0)
-        min_rsi = st.number_input("RSI Mínimo", value=0.0, step=5.0, max_value=100.0)
-        max_rsi = st.number_input("RSI Máximo", value=100.0, step=5.0, max_value=100.0)
-    
-    with col4:
-        min_return_1m = st.number_input("Retorno 1M Mínimo (%)", value=-100.0, step=5.0)
-        show_signals = st.checkbox("Mostrar Sinais de Trading", value=True)
-    
-    if st.button("🚀 Executar Screening", type="primary"):
-        screening_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        analyzer = FinancialAnalyzer()
-        
-        for i, ticker in enumerate(tickers):
-            status_text.text(f"Analisando {ticker}... ({i+1}/{len(tickers)})")
-            
-            try:
-                data, info = analyzer.get_stock_data(ticker, analysis_period)
-                
-                if data is not None and not data.empty and info:
-                    # Calcular indicadores
-                    data = analyzer.calculate_technical_indicators(data)
-                    
-                    # Métricas básicas
-                    current_price = data['Close'].iloc[-1]
-                    volume_avg = data['Volume'].mean()
-                    
-                    # Retornos
-                    return_1m = ((current_price - data['Close'].iloc[0]) / data['Close'].iloc[0]) * 100
-                    
-                    # Indicadores técnicos
-                    rsi_current = data['RSI'].iloc[-1] if 'RSI' in data.columns else None
-                    
-                    # Informações fundamentais
-                    market_cap = info.get('marketCap', 0) / 1e9 if info.get('marketCap') else 0  # Em bilhões
-                    pe_ratio = info.get('trailingPE', None)
-                    
-                    # Aplicar filtros
-                    if (min_price <= current_price <= max_price and
-                        volume_avg >= min_volume and
-                        market_cap >= min_market_cap and
-                        (pe_ratio is None or pe_ratio <= max_pe) and
-                        (rsi_current is None or (min_rsi <= rsi_current <= max_rsi)) and
-                        return_1m >= min_return_1m):
-                        
-                        # Sinais de trading
-                        signals = []
-                        if show_signals and rsi_current is not None:
-                            if rsi_current < 30:
-                                signals.append("🟢 RSI Oversold")
-                            elif rsi_current > 70:
-                                signals.append("🔴 RSI Overbought")
-                            
-                            # Sinal de média móvel
-                            if 'SMA_20' in data.columns and 'SMA_50' in data.columns:
-                                if data['SMA_20'].iloc[-1] > data['SMA_50'].iloc[-1]:
-                                    signals.append("📈 SMA Bullish")
-                                else:
-                                    signals.append("📉 SMA Bearish")
-                        
-                        screening_results.append({
-                            'Ticker': ticker,
-                            'Nome': info.get('shortName', 'N/A'),
-                            'Preço ($)': round(current_price, 2),
-                            'Retorno 1M (%)': round(return_1m, 2),
-                            'Volume Médio': int(volume_avg),
-                            'Market Cap (B)': round(market_cap, 2),
-                            'P/E': round(pe_ratio, 2) if pe_ratio else 'N/A',
-                            'RSI': round(rsi_current, 1) if rsi_current else 'N/A',
-                            'Sinais': ' | '.join(signals) if signals else 'Neutro',
-                            'Setor': info.get('sector', 'N/A')
-                        })
-                
-                progress_bar.progress((i + 1) / len(tickers))
-                
-            except Exception as e:
+    cls = m.get(label, "badge badge-neutral")
+    return f'<span class="{cls}">{label}</span>'
+
+# =========================
+# Predição — features & backtest
+# =========================
+def make_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    x = pd.DataFrame(index=df.index)
+    x["ret1"] = df["Close"].pct_change()
+    x["ret5"] = df["Close"].pct_change(5)
+    x["ret21"] = df["Close"].pct_change(21)
+    x["rsi"] = df["RSI14"]
+    x["ema20_dist"] = (df["Close"] - df["EMA20"]) / df["Close"]
+    x["ema50_dist"] = (df["Close"] - df["EMA50"]) / df["Close"]
+    x["atrp"] = df["ATR%"]
+    x["macd"] = df["MACD"]
+    x["macd_sig"] = df["MACDsig"]
+    x = x.replace([np.inf, -np.inf], np.nan).dropna()
+    y = (df["Close"].shift(-1) > df["Close"]).loc[x.index].astype(int)
+    return x, y
+
+def walk_forward_logit(X: pd.DataFrame, y: pd.Series, splits: int = 5):
+    tscv = TimeSeriesSplit(n_splits=min(splits, max(2, len(X)//60)))
+    aucs = []
+    preds = pd.Series(index=X.index, dtype=float)
+    for tr_idx, te_idx in tscv.split(X):
+        Xtr, Xte = X.iloc[tr_idx], X.iloc[te_idx]
+        ytr, yte = y.iloc[tr_idx], y.iloc[te_idx]
+        if len(np.unique(ytr)) < 2:
+            continue
+        model = LogisticRegression(max_iter=250, n_jobs=None)
+        model.fit(Xtr, ytr)
+        p = model.predict_proba(Xte)[:, 1]
+        preds.iloc[te_idx] = p
+        try:
+            aucs.append(roc_auc_score(yte, p))
+        except Exception:
+            pass
+    auc = float(np.nanmean(aucs)) if aucs else np.nan
+    return preds, auc
+
+def simulate_threshold(df_close: pd.Series, proba: pd.Series, th: float = 0.55):
+    proba = proba.reindex(df_close.index).fillna(0.5)
+    pos = np.where(proba >= th, 1, np.where(proba <= 1 - th, -1, 0))
+    ret = df_close.pct_change().fillna(0)
+    strat = pd.Series(pos, index=df_close.index).shift(1).fillna(0) * ret
+    eq = (1 + strat).cumprod()
+    buyhold = (1 + ret).cumprod()
+    return pd.DataFrame({"eq": eq, "buyhold": buyhold, "pos": pos, "ret": strat})
+
+# =========================
+# Risco — position sizing
+# =========================
+def position_size(capital: float, risk_perc: float, atr_value: float, atr_mult: float, price: float):
+    risk_amt = capital * (risk_perc / 100.0)
+    stop = atr_mult * atr_value
+    if stop <= 0 or price <= 0:
+        return 0, 0, 0
+    qty = math.floor(risk_amt / stop)
+    qty = max(qty, 0)
+    exposure = qty * price
+    return qty, stop, exposure
+
+# =========================
+# Sidebar — Parâmetros
+# =========================
+st.sidebar.title("⚙️ Parâmetros")
+
+with st.sidebar.expander("⛏️ Universos de Ativos", expanded=True):
+    st.caption("Se houver arquivos dos seus repositórios na pasta (ibov_tickers.txt, sp500_tickers.txt, ativos.json, assets_database.json), eu carrego automaticamente.")
+    default_br = ["PETR4.SA","VALE3.SA","ITUB4.SA","BBDC4.SA","BBAS3.SA","ABEV3.SA","WEGE3.SA","SUZB3.SA","B3SA3.SA","GGBR4.SA"]
+    default_us = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA"]
+    default_cr = ["BTC-USD","ETH-USD","SOL-USD"]
+
+    if REPO_TICKERS:
+        repo_str = ",".join(REPO_TICKERS)
+        st.success(f"Foram encontrados {len(REPO_TICKERS)} tickers em arquivos locais.")
+        blist = st.text_area("Lista geral detectada", value=repo_str, height=100)
+        user_list = [t.strip() for t in blist.split(",") if t.strip()]
+        br, us, cr = st.columns(3)
+        with br:
+            st.caption("Sugestões BR")
+            st.code(", ".join(default_br), language="text")
+        with us:
+            st.caption("Sugestões US")
+            st.code(", ".join(default_us), language="text")
+        with cr:
+            st.caption("Sugestões Cripto")
+            st.code(", ".join(default_cr), language="text")
+    else:
+        br = st.text_area("Brasil (.SA)", value=",".join(default_br))
+        us = st.text_area("USA", value=",".join(default_us))
+        cr = st.text_area("Cripto (USD)", value=",".join(default_cr))
+        user_list = []
+        for block in [br, us, cr]:
+            user_list += [t.strip() for t in block.split(",") if t.strip()]
+
+    limit_n = st.slider("Limite de ativos (screener)", 5, 120, 30, 5, help="Para evitar travamentos no Streamlit Cloud.")
+
+with st.sidebar.expander("⏱️ Janela & Intervalo", expanded=False):
+    start = st.date_input("Início", value=DEFAULT_START)
+    end = st.date_input("Fim", value=DEFAULT_END)
+    interval = st.selectbox("Intervalo", ["1d","1h","1wk"], index=0)
+
+with st.sidebar.expander("🧮 Filtros do Screener", expanded=True):
+    f_min_score = st.slider("Score mínimo", 0, 100, 0, 5)
+    f_rsi_min, f_rsi_max = st.slider("Faixa de RSI", 0, 100, (0, 100), 1)
+    f_price_min, f_price_max = st.slider("Faixa de preço (Close)", 0.0, 1000.0, (0.0, 1000.0), 1.0)
+    f_trend_align = st.checkbox("Exigir EMA20 > EMA50 > EMA200", value=False)
+
+with st.sidebar.expander("🎛️ Pesos do Score (avançado)", expanded=False):
+    w_trend = st.slider("Peso Tendência", 0, 100, 40, 5)
+    w_mom = st.slider("Peso Momentum", 0, 100, 35, 5)
+    w_band = st.slider("Peso Bandas/Vol", 0, 100, 15, 5)
+    w_short = st.slider("Peso Curto Prazo", 0, 100, 10, 5)
+
+with st.sidebar.expander("🧠 Predição (experimental)", expanded=False):
+    enable_pred = st.checkbox("Ativar predição (Análise/Backtest)", value=True, help="Requer scikit-learn instalado.")
+    thr = st.slider("Threshold compra (prob. de alta)", 0.50, 0.70, 0.55, 0.01)
+
+with st.sidebar.expander("💼 Risco", expanded=False):
+    capital = st.number_input("Capital (R$ / USD)", min_value=0.0, value=100000.0, step=1000.0)
+    risk_perc = st.slider("Risco por trade (%)", 0.1, 5.0, 1.0, 0.1)
+    atr_mult = st.slider("Stop = ATR x", 0.5, 5.0, 2.0, 0.5)
+
+st.sidebar.caption("Dica: reduza o limite de ativos se a execução ficar lenta.")
+
+# =========================
+# Título & Tabs
+# =========================
+st.title("🧭 Super Screener + Predição + Carteira (Yahoo Finance)")
+st.caption("Unindo ideias dos seus projetos — Screener • Análise • Probabilidades • Carteira & Risco — com visual moderno.")
+
+tabs = st.tabs([
+    "📊 Screener",
+    "📈 Análise do Ativo",
+    "🤖 Predição & Backtest",
+    "💼 Carteira & Risco",
+    "🗂️ Listas / Importação"
+])
+
+# =========================
+# 1) Screener
+# =========================
+with tabs[0]:
+    st.subheader("📊 Screener")
+    tickers = user_list[:limit_n]
+    if len(tickers) == 0:
+        st.info("Adicione tickers na barra lateral.")
+        st.stop()
+
+    progress = st.progress(0, text="Baixando dados…")
+    rows = []
+    for i, t in enumerate(tickers, start=1):
+        progress.progress(i / len(tickers), text=f"{t} ({i}/{len(tickers)})")
+        try:
+            df = download_prices(t, str(start), str(end), interval)
+            if df.empty or len(df) < 60:
                 continue
-        
-        status_text.empty()
-        progress_bar.empty()
-        
-        if screening_results:
-            df_results = pd.DataFrame(screening_results)
-            
-            st.success(f"✅ Encontradas {len(df_results)} ações que atendem aos critérios!")
-            
-            # Ordenar por retorno
-            df_results = df_results.sort_values('Retorno 1M (%)', ascending=False)
-            
-            # Exibir tabela
-            st.dataframe(
-                df_results,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                    "Preço ($)": st.column_config.NumberColumn("Preço ($)", format="%.2f"),
-                    "Retorno 1M (%)": st.column_config.NumberColumn("Retorno 1M (%)", format="%.2f"),
-                    "Volume Médio": st.column_config.NumberColumn("Volume Médio", format="%d"),
-                    "Market Cap (B)": st.column_config.NumberColumn("Market Cap (B)", format="%.2f"),
-                }
-            )
-            
-            # Gráficos de análise
-            if len(df_results) > 1:
-                st.subheader("📊 Análise Visual")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Gráfico de dispersão Risco vs Retorno
-                    fig_scatter = px.scatter(
-                        df_results[df_results['RSI'] != 'N/A'], 
-                        x='RSI', 
-                        y='Retorno 1M (%)',
-                        size='Market Cap (B)',
-                        color='Setor',
-                        hover_name='Ticker',
-                        title='RSI vs Retorno 1M'
-                    )
-                    st.plotly_chart(fig_scatter, use_container_width=True)
-                
-                with col2:
-                    # Gráfico de setores
-                    sector_counts = df_results['Setor'].value_counts()
-                    fig_pie = px.pie(
-                        values=sector_counts.values, 
-                        names=sector_counts.index,
-                        title='Distribuição por Setor'
-                    )
-                    st.plotly_chart(fig_pie, use_container_width=True)
-        
-        else:
-            st.warning("❌ Nenhuma ação encontrada com os critérios especificados. Tente ajustar os filtros.")
+            ind = build_indicators(df)
+            last = ind.iloc[-1]
+            sc = technical_score(last, w_trend, w_mom, w_band, w_short)
+            sig = classify_signal(sc)
+            rows.append({
+                "Ticker": t,
+                "Close": round(float(last["Close"]), 4),
+                "EMA20": round(float(last["EMA20"]), 4),
+                "EMA50": round(float(last["EMA50"]), 4),
+                "EMA200": round(float(last["EMA200"]), 4),
+                "RSI14": round(float(last["RSI14"]), 2),
+                "ATR%": round(float(last["ATR%"]), 2),
+                "Ret5D%": round(float(last["Ret5D"] * 100), 2),
+                "Ret21D%": round(float(last["Ret21D"] * 100), 2),
+                "Ret63D%": round(float(last["Ret63D"] * 100), 2),
+                "Score": sc,
+                "Sinal": sig,
+                "EMA Hierarquia?": bool(last["EMA20"] > last["EMA50"] > last["EMA200"]),
+            })
+        except Exception:
+            continue
+        time.sleep(0.01)
 
-def main():
-    st.markdown('<h1 class="main-header">📈 Sistema Financeiro Completo</h1>', 
-                unsafe_allow_html=True)
-    
-    # Sidebar para navegação
-    st.sidebar.title("🎛️ Navegação")
-    
-    page = st.sidebar.radio(
-        "Selecione o Módulo:",
-        ["🏠 Dashboard", "📊 Análise Individual", "🔮 Previsões", "🔍 Screener", "📈 Backtesting"],
-        index=0
+    progress.empty()
+
+    if not rows:
+        st.warning("Sem dados válidos. Verifique tickers/intervalo.")
+        st.stop()
+
+    df_scr = pd.DataFrame(rows).sort_values(["Score", "Ret21D%"], ascending=[False, False]).reset_index(drop=True)
+
+    # Filtros UI
+    mask = (df_scr["Score"] >= f_min_score) & \
+           (df_scr["RSI14"].between(f_rsi_min, f_rsi_max)) & \
+           (df_scr["Close"].between(f_price_min, f_price_max))
+    if f_trend_align:
+        mask &= df_scr["EMA Hierarquia?"]
+
+    df_flt = df_scr.loc[mask].copy()
+
+    # Badge HTML para Sinal (exibição bonita)
+    df_show = df_flt.copy()
+    df_show["Sinal"] = df_show["Sinal"].apply(render_badge)
+
+    st.dataframe(
+        df_show,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.0f"),
+            "Sinal": st.column_config.Column("Sinal", help="Classificação baseada no Score"),
+            "EMA Hierarquia?": st.column_config.CheckboxColumn("EMA20>EMA50>EMA200"),
+        }
     )
-    
-    analyzer = FinancialAnalyzer()
-    
-    if page == "🏠 Dashboard":
-        st.header("🏠 Dashboard Executivo")
-        
-        # Input para ticker principal
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            main_ticker = st.text_input("Ticker Principal:", value="AAPL", key="main_ticker").upper()
-        with col2:
-            dashboard_period = st.selectbox("Período:", ["3mo", "6mo", "1y", "2y"], index=2)
-        with col3:
-            auto_refresh = st.checkbox("Auto-refresh (30s)", value=False)
-        
-        if auto_refresh:
-            st.rerun()
-        
-        if main_ticker:
-            with st.spinner("Carregando dashboard..."):
-                data, info = analyzer.get_stock_data(main_ticker, dashboard_period)
-                
-                if data is not None and info:
-                    data = analyzer.calculate_technical_indicators(data)
-                    
-                    # Métricas principais
-                    current_price = data['Close'].iloc[-1]
-                    prev_close = data['Close'].iloc[-2]
-                    price_change = current_price - prev_close
-                    price_change_pct = (price_change / prev_close) * 100
-                    
-                    col1, col2, col3, col4, col5 = st.columns(5)
-                    
-                    with col1:
-                        st.metric("Preço Atual", f"${current_price:.2f}", 
-                                f"{price_change:+.2f} ({price_change_pct:+.2f}%)")
-                    
-                    with col2:
-                        volume_current = data['Volume'].iloc[-1]
-                        volume_avg = data['Volume'].mean()
-                        volume_change = ((volume_current - volume_avg) / volume_avg) * 100
-                        st.metric("Volume", f"{volume_current:,.0f}", f"{volume_change:+.1f}%")
-                    
-                    with col3:
-                        rsi = data['RSI'].iloc[-1] if 'RSI' in data.columns else 0
-                        st.metric("RSI", f"{rsi:.1f}", 
-                                "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral")
-                    
-                    with col4:
-                        market_cap = info.get('marketCap', 0) / 1e9
-                        st.metric("Market Cap", f"${market_cap:.1f}B")
-                    
-                    with col5:
-                        pe_ratio = info.get('trailingPE', 0)
-                        st.metric("P/E Ratio", f"{pe_ratio:.2f}" if pe_ratio else "N/A")
-                    
-                    # Gráfico principal
-                    fig = create_advanced_chart(data, main_ticker, 
-                                              ['SMA_20', 'SMA_50', 'BB', 'Volume', 'RSI', 'MACD'])
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Análise e previsão lado a lado
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.subheader("🎯 Análise Técnica")
-                        
-                        # Sinais automáticos
-                        signals = []
-                        
-                        if 'RSI' in data.columns:
-                            rsi_val = data['RSI'].iloc[-1]
-                            if rsi_val < 30:
-                                signals.append("🟢 **RSI Oversold** - Possível entrada")
-                            elif rsi_val > 70:
-                                signals.append("🔴 **RSI Overbought** - Possível saída")
-                        
-                        if all(col in data.columns for col in ['SMA_20', 'SMA_50']):
-                            if data['SMA_20'].iloc[-1] > data['SMA_50'].iloc[-1]:
-                                signals.append("📈 **Tendência de Alta** - SMA 20 > SMA 50")
-                            else:
-                                signals.append("📉 **Tendência de Baixa** - SMA 20 < SMA 50")
-                        
-                        if 'MACD' in data.columns and 'MACD_Signal' in data.columns:
-                            if data['MACD'].iloc[-1] > data['MACD_Signal'].iloc[-1]:
-                                signals.append("🚀 **MACD Bullish** - Momentum positivo")
-                            else:
-                                signals.append("⚠️ **MACD Bearish** - Momentum negativo")
-                        
-                        for signal in signals:
-                            st.markdown(signal)
-                        
-                        if not signals:
-                            st.info("Nenhum sinal claro identificado no momento.")
-                    
-                    with col2:
-                        st.subheader("🔮 Previsão de Preços")
-                        
-                        predictions, metrics, _ = analyzer.predict_prices(data)
-                        
-                        if predictions and metrics:
-                            for model_name, pred_price in predictions.items():
-                                change_pct = ((pred_price - current_price) / current_price) * 100
-                                r2_score = metrics[model_name]['R²']
-                                
-                                confidence = "Alta" if r2_score > 0.7 else "Média" if r2_score > 0.5 else "Baixa"
-                                
-                                st.markdown(f"**{model_name}:**")
-                                st.markdown(f"- Previsão: ${pred_price:.2f} ({change_pct:+.2f}%)")
-                                st.markdown(f"- Confiança: {confidence} (R² = {r2_score:.3f})")
-                                st.markdown("---")
-                        else:
-                            st.warning("Dados insuficientes para previsão confiável.")
-    
-    elif page == "📊 Análise Individual":
-        st.header("📊 Análise Técnica Individual")
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            ticker = st.text_input("Ticker:", value="AAPL", key="analysis_ticker").upper()
-        
-        with col2:
-            period = st.selectbox("Período:", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
-        
-        with col3:
-            st.write("**Indicadores:**")
-            show_sma = st.checkbox("SMAs", True)
-            show_bb = st.checkbox("Bollinger", True)
-            show_volume = st.checkbox("Volume", True)
-        
-        if ticker:
-            with st.spinner("Carregando análise..."):
-                data, info = analyzer.get_stock_data(ticker, period)
-                
-                if data is not None:
-                    data = analyzer.calculate_technical_indicators(data)
-                    
-                    # Informações da empresa
-                    if info:
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            st.subheader("ℹ️ Informações")
-                            st.write(f"**Nome:** {info.get('longName', 'N/A')}")
-                            st.write(f"**Setor:** {info.get('sector', 'N/A')}")
-                            st.write(f"**Indústria:** {info.get('industry', 'N/A')}")
-                        
-                        with col2:
-                            st.subheader("💰 Financeiro")
-                            market_cap = info.get('marketCap', 0) / 1e9 if info.get('marketCap') else 0
-                            st.write(f"**Market Cap:** ${market_cap:.2f}B")
-                            st.write(f"**P/E:** {info.get('trailingPE', 'N/A')}")
-                            div_yield = info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0
-                            st.write(f"**Div. Yield:** {div_yield:.2f}%")
-                        
-                        with col3:
-                            st.subheader("📈 Performance")
-                            high_52w = info.get('fiftyTwoWeekHigh', 0)
-                            low_52w = info.get('fiftyTwoWeekLow', 0)
-                            current = data['Close'].iloc[-1]
-                            st.write(f"**52W High:** ${high_52w:.2f}")
-                            st.write(f"**52W Low:** ${low_52w:.2f}")
-                            if high_52w and low_52w:
-                                pos_52w = ((current - low_52w) / (high_52w - low_52w)) * 100
-                                st.write(f"**Posição 52W:** {pos_52w:.1f}%")
-                    
-                    # Gráfico
-                    indicators = []
-                    if show_sma: indicators.extend(['SMA_20', 'SMA_50'])
-                    if show_bb: indicators.append('BB')
-                    if show_volume: indicators.append('Volume')
-                    indicators.extend(['RSI', 'MACD'])
-                    
-                    fig = create_advanced_chart(data, ticker, indicators)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Tabela de dados recentes
-                    st.subheader("📋 Dados Recentes")
-                    recent_data = data[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD']].tail(10)
-                    st.dataframe(recent_data, use_container_width=True)
-    
-    elif page == "🔮 Previsões":
-        st.header("🔮 Sistema de Previsões")
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            pred_ticker = st.text_input("Ticker:", value="AAPL", key="pred_ticker").upper()
-        
-        with col2:
-            pred_period = st.selectbox("Período Histórico:", ["6mo", "1y", "2y", "5y"], index=2)
-        
-        with col3:
-            days_ahead = st.number_input("Dias à Frente:", min_value=1, max_value=60, value=30)
-        
-        if st.button("🚀 Gerar Previsões", type="primary"):
-            with st.spinner("Processando modelos de previsão..."):
-                data, info = analyzer.get_stock_data(pred_ticker, pred_period)
-                
-                if data is not None:
-                    predictions, metrics, test_data = analyzer.predict_prices(data, days_ahead)
-                    
-                    if predictions and metrics:
-                        current_price = data['Close'].iloc[-1]
-                        
-                        st.subheader("🎯 Resultados das Previsões")
-                        
-                        # Métricas dos modelos
-                        col1, col2 = st.columns(2)
-                        
-                        for i, (model_name, pred_price) in enumerate(predictions.items()):
-                            change_pct = ((pred_price - current_price) / current_price) * 100
-                            model_metrics = metrics[model_name]
-                            
-                            with col1 if i == 0 else col2:
-                                st.markdown(f"""
-                                <div class="metric-card">
-                                    <h3>{model_name}</h3>
-                                    <h2>${pred_price:.2f}</h2>
-                                    <p style="color: {'green' if change_pct > 0 else 'red'};">
-                                        {change_pct:+.2f}% vs preço atual
-                                    </p>
-                                    <p><strong>Métricas:</strong></p>
-                                    <p>R²: {model_metrics['R²']:.4f}</p>
-                                    <p>RMSE: {model_metrics['RMSE']:.4f}</p>
-                                    <p>MAE: {model_metrics['MAE']:.4f}</p>
-                                </div>
-                                """, unsafe_allow_html=True)
-                        
-                        # Gráfico de comparação dos modelos
-                        if test_data:
-                            y_test, test_predictions = test_data
-                            
-                            fig = go.Figure()
-                            
-                            fig.add_trace(go.Scatter(
-                                y=y_test.values,
-                                name='Preço Real',
-                                line=dict(color='blue', width=3)
-                            ))
-                            
-                            colors = ['red', 'green', 'orange', 'purple']
-                            for i, (model_name, preds) in enumerate(test_predictions.items()):
-                                fig.add_trace(go.Scatter(
-                                    y=preds,
-                                    name=f'Pred. {model_name}',
-                                    line=dict(color=colors[i % len(colors)], dash='dash', width=2)
-                                ))
-                            
-                            fig.update_layout(
-                                title='Comparação: Previsões vs Preços Reais (Conjunto de Teste)',
-                                xaxis_title='Período de Teste',
-                                yaxis_title='Preço ($)',
-                                height=500,
-                                template="plotly_white"
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Resumo e recomendações
-                        st.subheader("📋 Resumo e Análise")
-                        
-                        avg_prediction = np.mean(list(predictions.values()))
-                        avg_change = ((avg_prediction - current_price) / current_price) * 100
-                        avg_r2 = np.mean([m['R²'] for m in metrics.values()])
-                        
-                        confidence_level = "Alta" if avg_r2 > 0.7 else "Média" if avg_r2 > 0.5 else "Baixa"
-                        
-                        st.info(f"""
-                        **Previsão Consenso:** ${avg_prediction:.2f} ({avg_change:+.2f}%)
-                        
-                        **Nível de Confiança:** {confidence_level} (R² médio: {avg_r2:.3f})
-                        
-                        **Interpretação:**
-                        - R² > 0.7: Modelo explica bem a variação dos preços
-                        - R² 0.5-0.7: Modelo moderadamente confiável  
-                        - R² < 0.5: Modelo com baixa capacidade preditiva
-                        
-                        ⚠️ **Aviso:** Previsões são baseadas em dados históricos e não garantem resultados futuros.
-                        Use apenas como ferramenta de apoio à decisão.
-                        """)
-                    
-                    else:
-                        st.error("Não foi possível gerar previsões. Dados insuficientes ou erro no modelo.")
-    
-    elif page == "🔍 Screener":
-        stock_screener()
-    
-    elif page == "📈 Backtesting":
-        st.header("📈 Backtesting de Estratégias")
-        
-        col1, col2, col3 = st.columns([2, 1, 1])
-        
-        with col1:
-            backtest_ticker = st.text_input("Ticker:", value="AAPL", key="backtest_ticker").upper()
-        
-        with col2:
-            backtest_period = st.selectbox("Período:", ["6mo", "1y", "2y", "5y"], index=2)
-        
-        with col3:
-            strategy = st.selectbox("Estratégia:", ["sma_crossover", "rsi_oversold"])
-        
-        if st.button("🧪 Executar Backtest", type="primary"):
-            with st.spinner("Executando backtest..."):
-                data, _ = analyzer.get_stock_data(backtest_ticker, backtest_period)
-                
-                if data is not None:
-                    result = analyzer.backtest_strategy(data, strategy)
-                    
-                    if result:
-                        strategy_return = result['total_return']
-                        buy_hold_return = result['buy_hold_return']
-                        strategy_data = result['strategy_data']
-                        
-                        # Métricas
-                        col1, col2, col3, col4 = st.columns(4)
-                        
-                        with col1:
-                            st.metric("Retorno Estratégia", f"{strategy_return*100:.2f}%")
-                        
-                        with col2:
-                            st.metric("Retorno Buy & Hold", f"{buy_hold_return*100:.2f}%")
-                        
-                        with col3:
-                            excess_return = strategy_return - buy_hold_return
-                            st.metric("Retorno Excesso", f"{excess_return*100:.2f}%")
-                        
-                        with col4:
-                            sharpe = strategy_data['Strategy_Returns'].mean() / strategy_data['Strategy_Returns'].std() * np.sqrt(252)
-                            st.metric("Sharpe Ratio", f"{sharpe:.3f}")
-                        
-                        # Gráfico de performance
-                        strategy_cumulative = (1 + strategy_data['Strategy_Returns']).cumprod()
-                        buy_hold_cumulative = (1 + strategy_data['Returns']).cumprod()
-                        
-                        fig = go.Figure()
-                        
-                        fig.add_trace(go.Scatter(
-                            x=strategy_data.index,
-                            y=strategy_cumulative,
-                            name='Estratégia',
-                            line=dict(color='blue', width=2)
-                        ))
-                        
-                        fig.add_trace(go.Scatter(
-                            x=strategy_data.index,
-                            y=buy_hold_cumulative,
-                            name='Buy & Hold',
-                            line=dict(color='red', width=2)
-                        ))
-                        
-                        fig.update_layout(
-                            title=f'Performance: {strategy.replace("_", " ").title()} vs Buy & Hold',
-                            xaxis_title='Data',
-                            yaxis_title='Retorno Acumulado',
-                            height=500,
-                            template="plotly_white"
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Análise detalhada
-                        st.subheader("📊 Análise Detalhada")
-                        
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.write("**Estatísticas da Estratégia:**")
-                            st.write(f"- Retorno Total: {strategy_return*100:.2f}%")
-                            st.write(f"- Retorno Anualizado: {(strategy_return ** (252/len(strategy_data)) - 1)*100:.2f}%")
-                            st.write(f"- Volatilidade: {strategy_data['Strategy_Returns'].std()*np.sqrt(252)*100:.2f}%")
-                            st.write(f"- Máximo Drawdown: {(strategy_cumulative / strategy_cumulative.cummax() - 1).min()*100:.2f}%")
-                        
-                        with col2:
-                            st.write("**Comparação:**")
-                            win_rate = (strategy_data['Strategy_Returns'] > 0).mean()
-                            st.write(f"- Taxa de Acerto: {win_rate*100:.1f}%")
-                            
-                            trades = (strategy_data['Position'].diff() != 0).sum()
-                            st.write(f"- Número de Trades: {trades}")
-                            
-                            if trades > 0:
-                                avg_trade = strategy_data['Strategy_Returns'].mean()
-                                st.write(f"- Retorno Médio por Trade: {avg_trade*100:.3f}%")
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("""
-    <div style='text-align: center; color: gray;'>
-        <p>Sistema Financeiro Completo | Dados: Yahoo Finance | 
-        ⚠️ Para fins educacionais - Não constitui recomendação de investimento</p>
-    </div>
-    """, unsafe_allow_html=True)
 
-if __name__ == "__main__":
-    main()
+    # Export CSV
+    csv = df_flt.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Baixar CSV filtrado", csv, "screener.csv", "text/csv")
+
+# =========================
+# 2) Análise do Ativo
+# =========================
+with tabs[1]:
+    st.subheader("📈 Análise do Ativo")
+    chosen = st.selectbox("Escolha o ativo", options=user_list, index=0)
+    df = download_prices(chosen, str(start), str(end), interval)
+    if df.empty:
+        st.warning("Sem dados para o ativo/período.")
+        st.stop()
+    ind = build_indicators(df)
+    last = ind.iloc[-1]
+
+    # Métricas rápidas (cards)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Preço", f"{last['Close']:.2f}")
+    with c2: st.metric("RSI(14)", f"{last['RSI14']:.1f}")
+    with c3: st.metric("ATR%", f"{last['ATR%']:.2f}%")
+    with c4:
+        sc = technical_score(last, w_trend, w_mom, w_band, w_short)
+        st.metric("Score Técnico", f"{sc:.0f} / 100")
+
+    # Gráfico — Candles + EMAs + Bandas
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=ind.index, open=ind["Open"], high=ind["High"], low=ind["Low"], close=ind["Close"],
+        name="Candles", opacity=0.85
+    ))
+    fig.add_trace(go.Scatter(x=ind.index, y=ind["EMA20"], name="EMA20"))
+    fig.add_trace(go.Scatter(x=ind.index, y=ind["EMA50"], name="EMA50"))
+    fig.add_trace(go.Scatter(x=ind.index, y=ind["EMA200"], name="EMA200"))
+    fig.add_trace(go.Scatter(x=ind.index, y=ind["BB_UP"], name="BB_UP", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=ind.index, y=ind["BB_MA20"], name="BB_MA20", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=ind.index, y=ind["BB_LO"], name="BB_LO", line=dict(dash="dot")))
+    fig.update_layout(
+        height=620,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis_rangeslider_visible=False,
+        xaxis_rangebreaks=[dict(bounds=["sat", "mon"])],  # pula fins de semana
+    )
+    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+
+    # Diagnóstico textual + Predição (opcional)
+    colA, colB = st.columns([1.3, 1.0], gap="large")
+    with colA:
+        sinal = classify_signal(sc)
+        st.markdown("#### Diagnóstico")
+        bullets = [
+            f"**Sinal**: {render_badge(sinal)}",
+            f"**EMAs**: {'EMA20>EMA50>EMA200 ✅' if (last['EMA20']>last['EMA50']>last['EMA200']) else 'Desalinhadas ⚠️'}",
+            f"**MACD**: {'Acima da linha de sinal ✅' if last['MACD']>last['MACDsig'] else 'Abaixo ⚠️'}",
+            f"**Retornos**: 5D {last['Ret5D']*100:.1f}%, 21D {last['Ret21D']*100:.1f}%, 63D {last['Ret63D']*100:.1f}%",
+        ]
+        st.write("\n".join([f"- {b}" for b in bullets]), unsafe_allow_html=True)
+
+    with colB:
+        if enable_pred and SKLEARN_OK:
+            with st.spinner("Treinando predição (logística, walk-forward)…"):
+                X, y = make_features(ind)
+                if len(X) > 200 and len(np.unique(y.dropna())) == 2:
+                    proba, auc = walk_forward_logit(X, y, splits=5)
+                    last_p = float(proba.dropna().iloc[-1]) if proba.dropna().size else float("nan")
+                    st.metric("Prob. de alta (D+1)", f"{last_p*100:0.1f}%")
+                    st.caption(f"AUC média (WF): {auc:0.3f}  •  (≈0.5 é aleatório)")
+                else:
+                    st.info("Amostra curta para predição robusta (≥200 barras).")
+        elif enable_pred and not SKLEARN_OK:
+            st.info("Instale scikit-learn para habilitar a predição (veja requirements.txt).")
+
+# =========================
+# 3) Predição & Backtest
+# =========================
+with tabs[2]:
+    st.subheader("🤖 Predição & Backtest (didático)")
+    chosen2 = st.selectbox("Ativo para predição", options=user_list, index=0, key="pred_sel")
+    df2 = download_prices(chosen2, str(start), str(end), interval)
+    if df2.empty:
+        st.warning("Sem dados para o ativo/período.")
+        st.stop()
+    ind2 = build_indicators(df2)
+
+    if not SKLEARN_OK:
+        st.info("Instale scikit-learn para usar esta aba.")
+    else:
+        X2, y2 = make_features(ind2)
+        if len(X2) < 200 or len(np.unique(y2.dropna())) < 2:
+            st.warning("Amostra insuficiente para walk-forward (≥200 barras e alvo variado).")
+        else:
+            with st.spinner("Treinando e simulando…"):
+                proba2, auc2 = walk_forward_logit(X2, y2, splits=5)
+                sim = simulate_threshold(ind2["Close"], proba2, th=thr)
+                c1, c2, c3 = st.columns(3)
+                with c1: st.metric("AUC (WF)", f"{auc2:0.3f}")
+                with c2: st.metric("Retorno Strat", f"{(sim['eq'].iloc[-1]-1)*100:0.2f}%")
+                with c3:
+                    dd = (sim["eq"] / sim["eq"].cummax() - 1).min()
+                    st.metric("Max Drawdown", f"{dd*100:0.2f}%")
+
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=sim.index, y=sim["eq"], name="Estratégia (Eq)"))
+                fig2.add_trace(go.Scatter(x=sim.index, y=sim["buyhold"], name="Buy&Hold"))
+                fig2.update_layout(height=420, margin=dict(l=0, r=0, t=10, b=0))
+                st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
+            st.caption("⚠️ Predição didática, sujeita a overfitting. Use como estudo, não como recomendação.")
+
+# =========================
+# 4) Carteira & Risco
+# =========================
+with tabs[3]:
+    st.subheader("💼 Carteira & Risco (ATR sizing)")
+    # Se vier do Screener com filtros aplicados usa df_flt; senao calcula aqui para o universo atual
+    if "df_flt" not in locals():
+        # executa um mini screener rápido no universo atual (sem filtros extras) para montar base
+        base_rows = []
+        for t in user_list[:limit_n]:
+            try:
+                dfb = download_prices(t, str(start), str(end), interval)
+                if dfb.empty or len(dfb) < 60: 
+                    continue
+                indb = build_indicators(dfb)
+                lastb = indb.iloc[-1]
+                scb = technical_score(lastb, w_trend, w_mom, w_band, w_short)
+                base_rows.append({
+                    "Ticker": t,
+                    "Close": float(lastb["Close"]),
+                    "RSI14": float(lastb["RSI14"]),
+                    "ATR%": float(lastb["ATR%"]),
+                    "Score": scb,
+                    "Sinal": classify_signal(scb),
+                })
+            except Exception:
+                continue
+        base = pd.DataFrame(base_rows)
+    else:
+        base = df_flt[["Ticker","Close","RSI14","ATR%","Score","Sinal"]].copy()
+
+    if base.empty:
+        st.info("Sem base para sugerir carteira. Rode o Screener na aba 1 ou verifique seus tickers.")
+    else:
+        st.markdown("#### Base de seleção")
+        st.dataframe(base.reset_index(drop=True), hide_index=True, use_container_width=True)
+
+        method = st.radio("Método de pesos", ["Equal-weight", "Inverso ao ATR"], horizontal=True)
+        n_top = st.slider("Qtd. de ativos (top por Score)", 3, min(25, len(base)), min(10, len(base)))
+        picks = base.sort_values("Score", ascending=False).head(n_top).copy()
+
+        if method == "Inverso ao ATR":
+            w = 1 / picks["ATR%"].replace(0, np.nan)
+            picks["Peso"] = w / w.sum()
+        else:
+            picks["Peso"] = 1.0 / len(picks)
+
+        picks["Alocado"] = picks["Peso"] * capital
+
+        # Tabela + gráfico de pizza
+        c1, c2 = st.columns([1.5, 1.0], gap="large")
+        with c1:
+            st.markdown("#### Sugestão de Alocação")
+            st.dataframe(
+                picks[["Ticker","Close","ATR%","Score","Sinal","Peso","Alocado"]]
+                .assign(Peso=lambda d: (d["Peso"]*100).round(2))
+                .rename(columns={"Peso":"Peso (%)"}),
+                use_container_width=True, hide_index=True
+            )
+        with c2:
+            figp = go.Figure(data=[go.Pie(labels=picks["Ticker"], values=picks["Peso"], hole=.45)])
+            figp.update_layout(height=360, margin=dict(l=0,r=0,t=10,b=0))
+            st.plotly_chart(figp, use_container_width=True)
+
+        st.markdown("#### Position sizing por ATR (unidade de risco)")
+        choose_risk = st.selectbox("Ativo", options=picks["Ticker"].tolist())
+        df_pos = download_prices(choose_risk, str(start), str(end), interval)
+        ind_pos = build_indicators(df_pos)
+        last_pos = ind_pos.iloc[-1]
+        qty, stop_abs, exposure = position_size(
+            capital=capital,
+            risk_perc=risk_perc,
+            atr_value=float(last_pos["ATR14"]),
+            atr_mult=atr_mult,
+            price=float(last_pos["Close"]),
+        )
+        st.write(
+            f"- Preço: **{last_pos['Close']:.2f}**  •  ATR(14): **{last_pos['ATR14']:.2f}**  →  Stop = **{atr_mult}×ATR = {stop_abs:.2f}**  \n"
+            f"- Risco/trade: **{risk_perc:.1f}%**  →  Quantidade: **{qty}**  •  Exposição: **{exposure:,.2f}**"
+        )
+
+# =========================
+# 5) Listas / Importação
+# =========================
+with tabs[4]:
+    st.subheader("🗂️ Listas de Ativos")
+    st.write("Baixe a lista atual, edite e reenvie. Ou cole manualmente na sidebar.")
+
+    current = pd.DataFrame({"ticker": user_list})
+    st.download_button("⬇️ Baixar lista atual (CSV)", data=current.to_csv(index=False).encode("utf-8"),
+                       file_name="lista_tickers.csv", mime="text/csv")
+
+    up = st.file_uploader("Subir CSV com coluna 'ticker'", type=["csv"])
+    if up is not None:
+        try:
+            df_up = pd.read_csv(up)
+            if "ticker" in df_up.columns:
+                new_list = df_up["ticker"].astype(str).str.strip().tolist()
+                st.success(f"Carregado {len(new_list)} tickers. Copie-os para a barra lateral para usar.")
+                st.dataframe(df_up.head(), use_container_width=True)
+            else:
+                st.error("CSV precisa conter a coluna 'ticker'.")
+        except Exception as e:
+            st.error(f"Erro ao ler CSV: {e}")
+
+st.caption("© Para estudo. Sem recomendação de investimento.")
