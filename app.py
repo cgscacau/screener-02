@@ -1,22 +1,20 @@
-# app.py — Screener + Sinais + Backtest + Carteira (Yahoo Finance)
+# app.py — Finance Hub (Screener + Sinais + Backtest + Carteira) — Yahoo Finance
+
 import io
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objs as go
-import plotly.express as pex
+import plotly.express as pex  # <- alias definitivo (evita colisão com variáveis)
 from sklearn.covariance import LedoitWolf
 from statsmodels.tsa.ar_model import AutoReg
 import streamlit as st
 
-st.set_page_config(page_title="Finance Hub — Screener, Sinais, Backtest e Carteira", layout="wide")
+st.set_page_config(page_title="Finance Hub — Screener, Sinais, Previsões e Carteira", layout="wide")
 
-# =========================================
-# Helpers robustos de dados
-# =========================================
-@st.cache_data(show_spinner=False, ttl=60 * 30)
+# ============================= Helpers =============================
+@st.cache_data(show_spinner=False, ttl=60*30)
 def fetch_history(tickers, period="3y", interval="1d"):
-    """Baixa OHLCV do Yahoo. Se 1 ticker, normaliza colunas para MultiIndex [ticker, campo]."""
     if isinstance(tickers, str):
         tickers = [tickers]
     data = yf.download(
@@ -31,7 +29,6 @@ def fetch_history(tickers, period="3y", interval="1d"):
     return data
 
 def split_close_volume(raw, fallback_ticker="TICKER"):
-    """Extrai Close (ou Adj Close) e Volume como DataFrames (colunas=tickers)."""
     if raw.empty:
         return pd.DataFrame(), pd.DataFrame()
     if not isinstance(raw.columns, pd.MultiIndex):
@@ -42,8 +39,7 @@ def split_close_volume(raw, fallback_ticker="TICKER"):
     volume = raw.xs("Volume", axis=1, level=1) if "Volume" in fields else pd.DataFrame(index=raw.index, columns=close.columns)
     return close, volume
 
-def pick_field_series(df_single_ticker: pd.DataFrame, field_name: str):
-    """Retorna uma Series do campo pedido, mesmo quando df tem MultiIndex de colunas."""
+def pick_field_series(df_single_ticker, field_name):
     if df_single_ticker is None or df_single_ticker.empty:
         return None
     if isinstance(df_single_ticker.columns, pd.MultiIndex):
@@ -52,14 +48,15 @@ def pick_field_series(df_single_ticker: pd.DataFrame, field_name: str):
             s = df_single_ticker.xs(field_name, axis=1, level=1)
             return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
         return None
-    return df_single_ticker[field_name] if field_name in df_single_ticker.columns else None
+    else:
+        return df_single_ticker[field_name] if field_name in df_single_ticker.columns else None
 
-def pick_close_series(df_single_ticker: pd.DataFrame):
-    """Escolhe Close -> Adj Close -> primeira coluna numérica disponível."""
+def pick_close_series(df_single_ticker):
     s = pick_field_series(df_single_ticker, "Close")
     if s is None:
         s = pick_field_series(df_single_ticker, "Adj Close")
     if s is None:
+        # fallback: primeira coluna numérica disponível
         for c in df_single_ticker.columns:
             series = pd.to_numeric(df_single_ticker[c], errors="coerce")
             if series.notna().any():
@@ -70,16 +67,14 @@ def pick_close_series(df_single_ticker: pd.DataFrame):
 def _safe_pct_change(s, periods=1):
     return s.pct_change(periods=periods).replace([np.inf, -np.inf], np.nan)
 
-def compute_atr14(o: pd.Series, hi: pd.Series, lo: pd.Series, c: pd.Series):
-    tr1 = (hi - lo).abs()
-    tr2 = (hi - c.shift()).abs()
-    tr3 = (lo - c.shift()).abs()
+def compute_atr14(o, h, l, c):
+    tr1 = (h - l).abs()
+    tr2 = (h - c.shift()).abs()
+    tr3 = (l - c.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(14).mean()
 
-# =========================================
-# Indicadores & Score
-# =========================================
+# ====================== Indicadores & Score ========================
 def indicators(df_close: pd.DataFrame):
     out = {}
     out["sma20"] = df_close.rolling(20).mean()
@@ -116,43 +111,39 @@ def build_signal_score(close, ind):
     vol20 = ind["vol20"].tail(1); ret1w = ind["ret_1w"].tail(1)
     dist_high = ind["dist_52w_high"].tail(1); dist_low = ind["dist_52w_low"].tail(1)
 
-    rows = []
-    for t in last.columns:
+    scores = []
+    for col in last.columns:
         sc = 50
-        if (last[t].iloc[0] > s20[t].iloc[0] > s50[t].iloc[0] > s200[t].iloc[0]): sc += 15
-        elif (last[t].iloc[0] < s20[t].iloc[0] < s50[t].iloc[0] < s200[t].iloc[0]): sc -= 15
+        if (last[col].iloc[0] > s20[col].iloc[0] > s50[col].iloc[0] > s200[col].iloc[0]): sc += 15
+        elif (last[col].iloc[0] < s20[col].iloc[0] < s50[col].iloc[0] < s200[col].iloc[0]): sc -= 15
 
-        val = rsi[t].iloc[0]
+        val = rsi[col].iloc[0]
         if pd.notna(val):
             if 50 <= val <= 60: sc += 5
             if 40 <= val < 50:  sc -= 5
             if val < 30:        sc += 10
             if val > 70:        sc -= 10
 
-        m = macd[t].iloc[0]; ms = macd_sig[t].iloc[0]
+        m = macd[col].iloc[0]; ms = macd_sig[col].iloc[0]
         if pd.notna(m) and pd.notna(ms): sc += 8 if m > ms else -8
 
-        if pd.notna(dist_high[t].iloc[0]) and dist_high[t].iloc[0] > -0.02: sc += 4
-        if pd.notna(dist_low[t].iloc[0]) and dist_low[t].iloc[0] < 0.02:    sc += 6
+        if pd.notna(dist_high[col].iloc[0]) and dist_high[col].iloc[0] > -0.02: sc += 4
+        if pd.notna(dist_low[col].iloc[0]) and dist_low[col].iloc[0] < 0.02:    sc += 6
 
-        if pd.notna(ret1w[t].iloc[0]):
-            if ret1w[t].iloc[0] > 0.03:  sc += 4
-            if ret1w[t].iloc[0] < -0.03: sc -= 4
+        if pd.notna(ret1w[col].iloc[0]):
+            if ret1w[col].iloc[0] > 0.03:  sc += 4
+            if ret1w[col].iloc[0] < -0.03: sc -= 4
 
-        if pd.notna(vol20[t].iloc[0]) and vol20[t].iloc[0] > 0.6: sc -= 5
+        if pd.notna(vol20[col].iloc[0]) and vol20[col].iloc[0] > 0.6: sc -= 5
+        scores.append((col, float(np.clip(sc, 0, 100))))
 
-        rows.append((t, float(np.clip(sc, 0, 100))))
-
-    out = pd.DataFrame(rows, columns=["Ticker", "Score"]).set_index("Ticker")
-    out["Sinal"] = pd.cut(out["Score"], [-0.1, 30, 45, 55, 70, 100.1],
-                          labels=["VENDA FORTE","VENDA","NEUTRO","COMPRA","COMPRA FORTE"])
+    out = pd.DataFrame(scores, columns=["Ticker", "Score"]).set_index("Ticker")
+    out["Sinal"] = pd.cut(out["Score"], [-0.1,30,45,55,70,100.1], labels=["VENDA FORTE","VENDA","NEUTRO","COMPRA","COMPRA FORTE"])
     return out
 
-# =========================================
-# Sidebar
-# =========================================
+# ============================= Sidebar =============================
 st.sidebar.title("Universo de Ativos (Yahoo)")
-st.sidebar.caption("Ex.: PETR4.SA, VALE3.SA, AAPL, MSFT, BTC-USD")
+st.sidebar.caption("Exemplos: PETR4.SA, VALE3.SA, AAPL, MSFT, BTC-USD")
 
 default_b3 = "PETR4.SA, VALE3.SA, BBAS3.SA, ITUB4.SA, B3SA3.SA, WEGE3.SA, HGLG11.SA"
 default_us = "AAPL, MSFT, NVDA, TSLA, AMZN, SPY, QQQ"
@@ -170,17 +161,12 @@ risk_free = st.sidebar.number_input("Selic anual (proxy RF)", value=0.105, step=
 slippage_bp = st.sidebar.number_input("Slippage (bps por trade)", value=5, step=1)
 
 if not tickers:
-    st.info("Adicione ao menos 1 ticker para começar.")
-    st.stop()
+    st.info("Adicione ao menos 1 ticker para começar."); st.stop()
 
-# =========================================
-# Tabs
-# =========================================
+# ============================= Tabs =============================
 tab1, tab2, tab3, tab4 = st.tabs(["🔎 Screener", "📈 Ativo & Sinais", "🧪 Backtest & Risco", "📊 Carteira"])
 
-# -----------------------------
-# TAB 1 — Screener
-# -----------------------------
+# ----------------------------- TAB 1 -----------------------------
 with tab1:
     st.header("🔎 Screener Multi-Ativos (Yahoo Finance)")
     with st.spinner("Baixando e processando cotações..."):
@@ -230,35 +216,32 @@ with tab1:
         )
 
         st.subheader("Ranking (Score → 0–100)")
-        st.plotly_chart(pex.bar(table_f.reset_index(), x="Ticker", y="Score", color="Sinal", height=420),
-                        use_container_width=True)
+        st.plotly_chart(pex.bar(table_f.reset_index(), x="Ticker", y="Score", color="Sinal", height=420), use_container_width=True)
         st.markdown("**Legenda:** 0–30 (Venda forte) · 30–45 (Venda) · 45–55 (Neutro) · 55–70 (Compra) · 70–100 (Compra forte)")
 
-# -----------------------------
-# TAB 2 — Ativo & Sinais
-# -----------------------------
+# ----------------------------- TAB 2 -----------------------------
 with tab2:
     st.header("📈 Análise do Ativo — Gráfico + Indicadores + Regras")
     sel = st.selectbox("Escolha um ativo", tickers, index=0)
 
-    with st.spinner("Baixando OHLCV do ativo…"):
+    with st.spinner("Baixando OHLCV completo do ativo…"):
         df_single = yf.download(sel, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
 
     if df_single.empty:
         st.warning("Sem dados para o ticker selecionado."); st.stop()
 
-    # Fechamento p/ indicadores
+    # Fechamento para indicadores
     pclose = pick_close_series(df_single)
     if pclose is None or pclose.dropna().empty:
         st.error("Não foi possível determinar a série de fechamento para este ativo."); st.stop()
 
-    # Séries OHLC p/ gráfico
+    # Séries OHLC para o gráfico
     o = pick_field_series(df_single, "Open")
     hi = pick_field_series(df_single, "High")
     lo = pick_field_series(df_single, "Low")
     c_plot = pick_field_series(df_single, "Close") or pick_field_series(df_single, "Adj Close")
 
-    # Fallback: se faltar qualquer OHLC, plota linha
+    # Se algum OHLC faltar, plota linha do fechamento (pclose)
     if any(s is None or s.dropna().empty for s in [o, hi, lo, c_plot]):
         st.warning("OHLC incompleto para Candlestick. Mostrando linha do fechamento.")
         fig_line = pex.line(pclose.rename("Close"))
@@ -271,9 +254,10 @@ with tab2:
         atr_last = float(atr_series.iloc[-1]) if atr_series.notna().any() else np.nan
 
         fig_c = go.Figure()
-        fig_c.add_trace(go.Candlestick(x=tmp.index, open=tmp["Open"], high=tmp["High"],
-                                       low=tmp["Low"], close=tmp["Close"], name="Preço"))
-        # MAs com base em pclose
+        fig_c.add_trace(go.Candlestick(
+            x=tmp.index, open=tmp["Open"], high=tmp["High"], low=tmp["Low"], close=tmp["Close"], name="Preço"
+        ))
+        # médias móveis sobre o candle
         sma20_plot = pclose.rolling(20).mean().reindex(tmp.index)
         sma50_plot = pclose.rolling(50).mean().reindex(tmp.index)
         sma200_plot = pclose.rolling(200).mean().reindex(tmp.index)
@@ -283,7 +267,7 @@ with tab2:
         fig_c.update_layout(height=520, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
         st.plotly_chart(fig_c, use_container_width=True)
 
-    # Indicadores/metrics (sempre pclose)
+    # Indicadores e métricas (base pclose)
     price_last = float(pclose.iloc[-1])
     sma20  = pclose.rolling(20).mean()
     sma50  = pclose.rolling(50).mean()
@@ -303,24 +287,23 @@ with tab2:
     colD.metric("MACD-σ", f"{float(macd.iloc[-1]-macd_sig.iloc[-1]):.3f}")
 
     st.subheader("Score & Sinal (mesma régua do Screener)")
-    ind_one = indicators(pclose.to_frame(sel))
-    score_one = build_signal_score(pclose.to_frame(sel), ind_one)
+    tmp_close = pclose.to_frame(sel)
+    ind_one = indicators(tmp_close)
+    score_one = build_signal_score(tmp_close, ind_one)
     st.dataframe(score_one, use_container_width=True)
 
-# -----------------------------
-# TAB 3 — Backtest & Risco
-# -----------------------------
+# ----------------------------- TAB 3 -----------------------------
 with tab3:
-    st.header("🧪 Backtest Rápido + Gestão de Risco")
+    st.header("🧪 Backtest Rápido + Gestão de Risco (ATR/Stop/TP)")
     sel2 = st.selectbox("Ativo para backtest", tickers, index=min(1, len(tickers)-1))
-    entry_logic = st.selectbox("Entrada", ["Cruzamento SMA20>50", "MACD > Sinal", "RSI<30 (reversão)"], index=0)
+    entry_logic = st.selectbox("Lógica de entrada", ["Cruzamento SMA20>50", "MACD > Sinal", "RSI<30 (reversão)"], index=0)
     exit_logic = st.selectbox("Saída", ["Stop ATR & Take Profit R", "Cruzamento SMA20<50", "MACD < Sinal", "RSI>70"], index=0)
     atr_mult = st.slider("Stop ATR (x)", 0.5, 6.0, 2.0, 0.5)
     take_R = st.slider("Take Profit (R múltiplos)", 0.5, 6.0, 2.0, 0.5)
     fixed_risk = st.number_input("Risco fixo por trade (% do capital)", 0.5, 10.0, 1.0, 0.5)
     slippage = (slippage_bp / 10000.0)
 
-    with st.spinner("Preparando dados…"):
+    with st.spinner("Preparando dados para backtest…"):
         df_bt = yf.download(sel2, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
         if df_bt.empty:
             st.warning("Sem dados para backtest.")
@@ -329,7 +312,7 @@ with tab3:
             lo = pick_field_series(df_bt, "Low"); pclose_bt = pick_close_series(df_bt)
             if any(s is None or s.dropna().empty for s in [o, hi, lo, pclose_bt]):
                 st.warning("Dados insuficientes p/ backtest."); st.stop()
-            df_bt = pd.DataFrame({"Open": o, "High": hi, "Low": lo, "Close": pclose_bt}).dropna()
+            df_bt = pd.DataFrame({"Open":o,"High":hi,"Low":lo,"Close":pclose_bt}).dropna()
 
             df_bt["SMA20"] = df_bt["Close"].rolling(20).mean()
             df_bt["SMA50"] = df_bt["Close"].rolling(50).mean()
@@ -404,12 +387,9 @@ with tab3:
                 for _, tr in trdf.iterrows():
                     if pd.notna(tr["close_time"]):
                         cap *= (1 + tr["ret"]); curve.loc[tr["close_time"]:] = cap
-                st.plotly_chart(pex.line(curve.rename("Equity Curve"), title="Curva de Capital (aprox.)"),
-                                use_container_width=True)
+                st.plotly_chart(pex.line(curve.rename("Equity Curve"), title="Curva de Capital (aprox.)"), use_container_width=True)
 
-# -----------------------------
-# TAB 4 — Carteira (Markowitz)
-# -----------------------------
+# ----------------------------- TAB 4 -----------------------------
 with tab4:
     st.header("📊 Carteira — Markowitz (Ledoit-Wolf) + Simulação")
     with st.spinner("Coletando dados…"):
@@ -441,9 +421,7 @@ with tab4:
     buff = io.StringIO(); (weights*100).to_csv(buff, header=["Peso_%"])
     st.download_button("Baixar pesos em CSV", data=buff.getvalue(), file_name="pesos_portfolio.csv", mime="text/csv")
 
-# -----------------------------
-# EXTRA — Previsões (opcional)
-# -----------------------------
+# ---------------------- EXTRA — Previsões ------------------------
 st.markdown("---")
 with st.expander("🔮 Previsões curtas & Monte Carlo (opcional)"):
     sel3 = st.selectbox("Ativo", tickers, key="pred_sel")
@@ -484,9 +462,8 @@ with st.expander("🔮 Previsões curtas & Monte Carlo (opcional)"):
                 idx_future = pd.bdate_range(df_pred.index[-1], periods=horizon+1, inclusive="right")
 
             df_paths = pd.DataFrame(price_paths, index=idx_future[:price_paths.shape[0]])
-            st.plotly_chart(pex.line(df_paths.iloc[:, :min(50, paths)], title=f"Simulações — {sel3}"),
-                            use_container_width=True)
+            st.plotly_chart(pex.line(df_paths.iloc[:, :min(50, paths)], title=f"Simulações — {sel3}"), use_container_width=True)
             q = np.nanpercentile(price_paths[-1], [5,25,50,75,95])
             st.write(pd.DataFrame({"P5":[q[0]],"P25":[q[1]],"P50":[q[2]],"P75":[q[3]],"P95":[q[4]]}).style.format("{:.2f}"))
 
-st.success("Código carregado com alias do Plotly = 'pex', fechamento = 'pclose' e checagens de OHLC consistentes (o/hi/lo/c_plot).")
+st.success("Versão corrigida: alias Plotly = 'pex', séries OHLC = o/hi/lo/c_plot, fechamento = 'pclose'.")
