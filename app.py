@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objs as go
-import plotly.express as px
+import plotly.express as pex
 from sklearn.covariance import LedoitWolf
 from statsmodels.tsa.ar_model import AutoReg
 import streamlit as st
@@ -233,11 +233,11 @@ with tab1:
         )
 
         st.subheader("Ranking (Score → 0–100)")
-        st.plotly_chart(px.bar(table_f.reset_index(), x="Ticker", y="Score", color="Sinal", height=420), use_container_width=True)
+        st.plotly_chart(pex.bar(table_f.reset_index(), x="Ticker", y="Score", color="Sinal", height=420), use_container_width=True)
         st.markdown("**Legenda:** 0–30 (Venda forte) · 30–45 (Venda) · 45–55 (Neutro) · 55–70 (Compra) · 70–100 (Compra forte)")
 
 # -----------------------------
-# TAB 2 — Ativo & Sinais (sem colisão com px)
+# TAB 2 — Ativo & Sinais (sem colisão com pex)
 # -----------------------------
 with tab2:
     st.header("📈 Análise do Ativo — Gráfico + Indicadores + Regras")
@@ -262,7 +262,7 @@ with tab2:
     # Plot: se OHLC incompleto, mostra linha do fechamento
     if any(s is None or s.dropna().empty for s in [o, h, l, c_for_plot]):
         st.warning("OHLC incompleto para Candlestick. Mostrando linha do fechamento.")
-        fig_line = px.line(pclose.rename("Close"))
+        fig_line = pex.line(pclose.rename("Close"))
         fig_line.update_layout(height=520)
         st.plotly_chart(fig_line, use_container_width=True)
         atr_last = np.nan
@@ -366,30 +366,30 @@ with tab3:
                     stop = row["Close"] - atr_mult * row["ATR"]
                     risk_per_share = max(row["Close"] - stop, 1e-6)
                     qty = max(int((capital*(fixed_risk/100.0))/risk_per_share), 1)
-                    entry_px = row["Close"] * (1 + slippage)
-                    stop_px = stop; tp_px = entry_px + take_R * (entry_px - stop_px)
+                    entry_pex = row["Close"] * (1 + slippage)
+                    stop_pex = stop; tp_pex = entry_pex + take_R * (entry_pex - stop_pex)
                     in_pos = True
-                    trades.append({"open_time": df_bt.index[i], "open_px": entry_px, "qty": qty,
-                                   "stop_px": stop_px, "tp_px": tp_px, "close_time": None, "close_px": None, "ret": None})
+                    trades.append({"open_time": df_bt.index[i], "open_pex": entry_pex, "qty": qty,
+                                   "stop_pex": stop_pex, "tp_pex": tp_pex, "close_time": None, "close_pex": None, "ret": None})
                     continue
                 if in_pos:
                     low = row["Low"] * (1 - slippage); high = row["High"] * (1 - slippage)
-                    exit_px = None
-                    if low <= trades[-1]["stop_px"]:
-                        exit_px = trades[-1]["stop_px"]
-                    elif high >= trades[-1]["tp_px"]:
-                        exit_px = trades[-1]["tp_px"]
+                    exit_pex = None
+                    if low <= trades[-1]["stop_pex"]:
+                        exit_pex = trades[-1]["stop_pex"]
+                    elif high >= trades[-1]["tp_pex"]:
+                        exit_pex = trades[-1]["tp_pex"]
                     elif row["EXIT"]:
-                        exit_px = row["Close"] * (1 - slippage)
-                    if exit_px is not None:
-                        trades[-1]["close_time"] = df_bt.index[i]; trades[-1]["close_px"] = exit_px
-                        pnl = (exit_px - trades[-1]["open_px"]) * trades[-1]["qty"]
+                        exit_pex = row["Close"] * (1 - slippage)
+                    if exit_pex is not None:
+                        trades[-1]["close_time"] = df_bt.index[i]; trades[-1]["close_pex"] = exit_pex
+                        pnl = (exit_pex - trades[-1]["open_pex"]) * trades[-1]["qty"]
                         trades[-1]["ret"] = pnl / capital; capital *= (1 + trades[-1]["ret"]); in_pos = False
 
             if trades and trades[-1]["close_time"] is None:
-                last_px = df_bt["Close"].iloc[-1] * (1 - slippage)
-                trades[-1]["close_time"] = df_bt.index[-1]; trades[-1]["close_px"] = last_px
-                pnl = (last_px - trades[-1]["open_px"]) * trades[-1]["qty"]
+                last_pex = df_bt["Close"].iloc[-1] * (1 - slippage)
+                trades[-1]["close_time"] = df_bt.index[-1]; trades[-1]["close_pex"] = last_pex
+                pnl = (last_pex - trades[-1]["open_pex"]) * trades[-1]["qty"]
                 trades[-1]["ret"] = pnl / capital
 
             trdf = pd.DataFrame(trades)
@@ -397,8 +397,8 @@ with tab3:
                 st.warning("Nenhuma operação gerada.")
             else:
                 st.subheader("Resumo dos Trades")
-                st.dataframe(trdf[["open_time","open_px","close_time","close_px","ret"]]
-                             .style.format({"open_px":"{:.2f}","close_px":"{:.2f}","ret":"{:.2%}"}),
+                st.dataframe(trdf[["open_time","open_pex","close_time","close_pex","ret"]]
+                             .style.format({"open_pex":"{:.2f}","close_pex":"{:.2f}","ret":"{:.2%}"}),
                              use_container_width=True)
                 st.caption(f"Capital final simulado (teórico): **R$ {capital:,.2f}**".replace(",", "X").replace(".", ",").replace("X","."))
 
@@ -406,7 +406,7 @@ with tab3:
                 for _, tr in trdf.iterrows():
                     if pd.notna(tr["close_time"]):
                         cap *= (1 + tr["ret"]); curve.loc[tr["close_time"]:] = cap
-                st.plotly_chart(px.line(curve.rename("Equity Curve"), title="Curva de Capital (aprox.)"), use_container_width=True)
+                st.plotly_chart(pex.line(curve.rename("Equity Curve"), title="Curva de Capital (aprox.)"), use_container_width=True)
 
 # -----------------------------
 # TAB 4 — Carteira (Markowitz)
@@ -430,7 +430,7 @@ with tab4:
     port_mu = Ws @ mu.values
     port_vol = np.sqrt(np.einsum("ij,jk,ik->i", Ws, cov.values*252, Ws))
     sharpe = (port_mu - risk_free) / np.where(port_vol==0, np.nan, port_vol)
-    st.plotly_chart(px.scatter(pd.DataFrame({"Retorno":port_mu,"Vol":port_vol,"Sharpe":sharpe}),
+    st.plotly_chart(pex.scatter(pd.DataFrame({"Retorno":port_mu,"Vol":port_vol,"Sharpe":sharpe}),
                                x="Vol", y="Retorno", color="Sharpe", title="Fronteira (simulada)", height=520),
                     use_container_width=True)
 
@@ -485,8 +485,8 @@ with st.expander("🔮 Previsões curtas & Monte Carlo (opcional)"):
                 idx_future = pd.bdate_range(df_pred.index[-1], periods=horizon+1, inclusive="right")
 
             df_paths = pd.DataFrame(price_paths, index=idx_future[:price_paths.shape[0]])
-            st.plotly_chart(px.line(df_paths.iloc[:, :min(50, paths)], title=f"Simulações — {sel3}"), use_container_width=True)
+            st.plotly_chart(pex.line(df_paths.iloc[:, :min(50, paths)], title=f"Simulações — {sel3}"), use_container_width=True)
             q = np.nanpercentile(price_paths[-1], [5,25,50,75,95])
             st.write(pd.DataFrame({"P5":[q[0]],"P25":[q[1]],"P50":[q[2]],"P75":[q[3]],"P95":[q[4]]}).style.format("{:.2f}"))
 
-st.success("App reescrito: nenhuma variável chamada 'px' (série) — só Plotly Express. Fechamento padronizado como 'pclose' em todas as abas.")
+st.success("App reescrito: nenhuma variável chamada 'pex' (série) — só Plotly Express. Fechamento padronizado como 'pclose' em todas as abas.")
