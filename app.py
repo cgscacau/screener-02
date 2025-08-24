@@ -67,27 +67,41 @@ if "portfolio" not in st.session_state:
 
 # =============== Banco de ativos (persistência) ===============
 def load_asset_bank() -> List[str]:
-    if ASSET_BANK_FILE.exists():
+    """
+    Lê o banco mestre de ativos de:
+      - ativos.json  -> {"tickers":[...]}  OU  lista direta [...]
+      - assets_database.json -> {"acoes_br":[...], "acoes_us":[...], "etfs":[...], "indices":[...],
+                                 "fx":[...], "cripto":[...], "futuros":[...], "custom":[...]}
+    Retorna lista única, upper(), sem vazios.
+    """
+    candidates = [ASSET_BANK_FILE, Path("assets_database.json")]
+    category_keys = ["acoes_br", "acoes_us", "etfs", "indices", "fx", "cripto", "futuros", "custom", "ativos", "assets"]
+    for p in candidates:
+        if not p.exists():
+            continue
         try:
-            data = json.loads(ASSET_BANK_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                lst = data
-            else:
-                lst = data.get("tickers") or data.get("ativos") or []
-            lst = [str(t).strip().upper() for t in lst if str(t).strip()]
-            return list(dict.fromkeys(lst))
+            data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            continue
+
+        tickers: List[str] = []
+        if isinstance(data, list):
+            tickers = data
+        elif isinstance(data, dict):
+            if "tickers" in data and isinstance(data["tickers"], list):
+                tickers = data["tickers"]
+            else:
+                for k in category_keys:
+                    v = data.get(k)
+                    if isinstance(v, list):
+                        tickers.extend(v)
+
+        tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
+        if tickers:
+            # remove duplicatas preservando ordem
+            return list(dict.fromkeys(tickers))
+
     return []
-
-def save_asset_bank(tickers: List[str]) -> None:
-    tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
-    tickers = list(dict.fromkeys(tickers))
-    ASSET_BANK_FILE.write_text(json.dumps({"tickers": tickers}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-# carrega se ainda não trouxe pra sessão
-if not st.session_state.asset_bank:
-    st.session_state.asset_bank = load_asset_bank()
 
 # =============== Yahoo robusto ===============
 @st.cache_data(ttl=60 * 60)
@@ -565,7 +579,22 @@ with tabs[3]:
         st.markdown("#### Construção da Carteira")
         mode = st.radio("Modo de pesos", ["Equal-weight", "Inverso ao ATR", "📝 Manual (editar)"], horizontal=True, key="peso_mode")
 
-        n_top = st.slider("Qtd. de ativos (top por Score)", 3, min(25, len(base)), min(10, len(base)), key="peso_n_top")
+        # --- antes de construir 'picks' ---
+        n_total = len(base)
+        if n_total <= 1:
+            n_top = 1
+            st.caption("Só há 1 ativo disponível para a carteira.")
+        else:
+            n_max = min(25, n_total)
+            n_top = st.slider(
+                "Qtd. de ativos (top por Score)",
+                min_value=1,           # sempre < max
+                max_value=n_max,
+                value=min(10, n_max),
+                step=1,
+                key="peso_n_top"
+            )
+        
         picks = base.sort_values("Score", ascending=False).head(n_top).copy()
 
         if mode == "Inverso ao ATR":
