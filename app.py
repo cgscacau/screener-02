@@ -256,58 +256,49 @@ with tab2:
     c_for_plot = pick_field_series(df_single, "Close") or pick_field_series(df_single, "Adj Close")
     pclose = pick_close_series(df_single)  # fechamento para indicadores
 
-    if pclose is None or pclose.dropna().empty:
-        st.error("Não foi possível determinar a série de fechamento para este ativo."); st.stop()
-
-    # Plot: se OHLC incompleto, mostra linha do fechamento
-    if any(s is None or s.dropna().empty for s in [o, h, l, c_for_plot]):
+    if any(s is None or s.dropna().empty for s in [o, h, l, c_plot]):
         st.warning("OHLC incompleto para Candlestick. Mostrando linha do fechamento.")
-        fig_line = pex.line(pclose.rename("Close"))
+        fig_line = pex.line(pclose.rename("Close"))  # <- usa pex (Plotly) e pclose (Series)
         fig_line.update_layout(height=520)
         st.plotly_chart(fig_line, use_container_width=True)
         atr_last = np.nan
     else:
-        ohlc = pd.DataFrame({"Open":o, "High":h, "Low":l, "Close":c_for_plot}).dropna()
-        atr_series = compute_atr14(ohlc["Open"], ohlc["High"], ohlc["Low"], ohlc["Close"])
-        atr_last = float(atr_series.iloc[-1]) if atr_series.notna().any() else np.nan
-
+        tmp = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c_plot}).dropna()
+        # ATR usa OHLC coerente
+        df_ind = tmp.copy()
+        df_ind["ATR14"] = compute_atr14(df_ind["Open"], df_ind["High"], df_ind["Low"], df_ind["Close"])
+        atr_last = float(df_ind["ATR14"].iloc[-1]) if df_ind["ATR14"].notna().any() else np.nan
+    
         fig_c = go.Figure()
-        fig_c.add_trace(go.Candlestick(x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
-                                       low=ohlc["Low"], close=ohlc["Close"], name="Preço"))
-        # MAs no gráfico (com base em pclose, para coerência)
-        sma20_plot = pclose.rolling(20).mean().reindex(ohlc.index)
-        sma50_plot = pclose.rolling(50).mean().reindex(ohlc.index)
-        sma200_plot = pclose.rolling(200).mean().reindex(ohlc.index)
-        fig_c.add_trace(go.Scatter(x=ohlc.index, y=sma20_plot, name="SMA20", mode="lines"))
-        fig_c.add_trace(go.Scatter(x=ohlc.index, y=sma50_plot, name="SMA50", mode="lines"))
-        fig_c.add_trace(go.Scatter(x=ohlc.index, y=sma200_plot, name="SMA200", mode="lines"))
+        fig_c.add_trace(go.Candlestick(x=tmp.index, open=tmp["Open"], high=tmp["High"],
+                                       low=tmp["Low"], close=tmp["Close"], name="Preço"))
         fig_c.update_layout(height=520, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
         st.plotly_chart(fig_c, use_container_width=True)
-
-    # Indicadores e métricas (sempre com base em pclose)
-    price_last = float(pclose.iloc[-1])
-    sma20  = pclose.rolling(20).mean()
-    sma50  = pclose.rolling(50).mean()
-    sma200 = pclose.rolling(200).mean()
-    ema12  = pclose.ewm(span=12, adjust=False).mean()
-    ema26  = pclose.ewm(span=26, adjust=False).mean()
-    macd   = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    delta = pclose.diff()
-    up = delta.clip(lower=0); down = -delta.clip(upper=0)
-    rsi = 100 - 100 / (1 + (up.rolling(14).mean() / down.rolling(14).mean()))
-
-    colA, colB, colC, colD = st.columns(4)
-    colA.metric("Preço", f"{price_last:.2f}")
-    colB.metric("ATR14", f"{atr_last:.2f}" if np.isfinite(atr_last) else "—")
-    colC.metric("RSI14", f"{float(rsi.iloc[-1]):.1f}" if not np.isnan(rsi.iloc[-1]) else "—")
-    colD.metric("MACD-σ", f"{float(macd.iloc[-1]-macd_sig.iloc[-1]):.3f}")
-
-    st.subheader("Score & Sinal (mesma régua do Screener)")
-    tmp_close = pclose.to_frame(sel)
-    ind_one = indicators(tmp_close)
-    score_one = build_signal_score(tmp_close, ind_one)
-    st.dataframe(score_one, use_container_width=True)
+    
+        # Indicadores e métricas (sempre com base em pclose)
+        price_last = float(pclose.iloc[-1])
+        sma20  = pclose.rolling(20).mean()
+        sma50  = pclose.rolling(50).mean()
+        sma200 = pclose.rolling(200).mean()
+        ema12  = pclose.ewm(span=12, adjust=False).mean()
+        ema26  = pclose.ewm(span=26, adjust=False).mean()
+        macd   = ema12 - ema26
+        macd_sig = macd.ewm(span=9, adjust=False).mean()
+        delta = pclose.diff()
+        up = delta.clip(lower=0); down = -delta.clip(upper=0)
+        rsi = 100 - 100 / (1 + (up.rolling(14).mean() / down.rolling(14).mean()))
+    
+        colA, colB, colC, colD = st.columns(4)
+        colA.metric("Preço", f"{price_last:.2f}")
+        colB.metric("ATR14", f"{atr_last:.2f}" if np.isfinite(atr_last) else "—")
+        colC.metric("RSI14", f"{float(rsi.iloc[-1]):.1f}" if not np.isnan(rsi.iloc[-1]) else "—")
+        colD.metric("MACD-σ", f"{float(macd.iloc[-1]-macd_sig.iloc[-1]):.3f}")
+    
+        st.subheader("Score & Sinal (mesma régua do Screener)")
+        tmp_close = pclose.to_frame(sel)
+        ind_one = indicators(tmp_close)
+        score_one = build_signal_score(tmp_close, ind_one)
+        st.dataframe(score_one, use_container_width=True)
 
 # -----------------------------
 # TAB 3 — Backtest & Risco
