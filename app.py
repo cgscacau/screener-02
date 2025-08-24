@@ -254,24 +254,42 @@ with tab2:
     h = pick_field_series(df_single, "High")
     l = pick_field_series(df_single, "Low")
     c_for_plot = pick_field_series(df_single, "Close") or pick_field_series(df_single, "Adj Close")
-    pclose = pick_close_series(df_single)  # fechamento para indicadores
-
-    if any(s is None or s.dropna().empty for s in [o, h, l, c_plot]):
+    # 1) Fechamento para indicadores (robusto)
+    pclose = pick_close_series(df_single)
+    if pclose is None or pclose.dropna().empty:
+        st.error("Não foi possível determinar a série de fechamento para este ativo.")
+        st.stop()
+    
+    # 2) Séries OHLC para o gráfico
+    o = pick_field_series(df_single, "Open")
+    hi = pick_field_series(df_single, "High")
+    lo = pick_field_series(df_single, "Low")
+    c_plot = pick_field_series(df_single, "Close") or pick_field_series(df_single, "Adj Close")
+    
+    # 3) Se faltar qualquer OHLC, plota linha do fechamento (pclose)
+    if any(s is None or s.dropna().empty for s in [o, hi, lo, c_plot]):
         st.warning("OHLC incompleto para Candlestick. Mostrando linha do fechamento.")
-        fig_line = pex.line(pclose.rename("Close"))  # <- usa pex (Plotly) e pclose (Series)
+        fig_line = pex.line(pclose.rename("Close"))
         fig_line.update_layout(height=520)
         st.plotly_chart(fig_line, use_container_width=True)
         atr_last = np.nan
     else:
-        tmp = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c_plot}).dropna()
-        # ATR usa OHLC coerente
-        df_ind = tmp.copy()
-        df_ind["ATR14"] = compute_atr14(df_ind["Open"], df_ind["High"], df_ind["Low"], df_ind["Close"])
-        atr_last = float(df_ind["ATR14"].iloc[-1]) if df_ind["ATR14"].notna().any() else np.nan
+        # Candlestick + ATR
+        tmp = pd.DataFrame({"Open": o, "High": hi, "Low": lo, "Close": c_plot}).dropna()
+        atr_series = compute_atr14(tmp["Open"], tmp["High"], tmp["Low"], tmp["Close"])
+        atr_last = float(atr_series.iloc[-1]) if atr_series.notna().any() else np.nan
     
         fig_c = go.Figure()
-        fig_c.add_trace(go.Candlestick(x=tmp.index, open=tmp["Open"], high=tmp["High"],
-                                       low=tmp["Low"], close=tmp["Close"], name="Preço"))
+        fig_c.add_trace(go.Candlestick(
+            x=tmp.index, open=tmp["Open"], high=tmp["High"], low=tmp["Low"], close=tmp["Close"], name="Preço"
+        ))
+        # Médias em cima do candle (opcional)
+        sma20_plot = pclose.rolling(20).mean().reindex(tmp.index)
+        sma50_plot = pclose.rolling(50).mean().reindex(tmp.index)
+        sma200_plot = pclose.rolling(200).mean().reindex(tmp.index)
+        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma20_plot, name="SMA20", mode="lines"))
+        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma50_plot, name="SMA50", mode="lines"))
+        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma200_plot, name="SMA200", mode="lines"))
         fig_c.update_layout(height=520, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
         st.plotly_chart(fig_c, use_container_width=True)
     
