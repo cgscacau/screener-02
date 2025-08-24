@@ -1,20 +1,24 @@
-# app.py — Finance Hub (Screener + Sinais + Backtest + Carteira) — Yahoo Finance
-
+# app.py — Finance Hub (Screener • Sinais • Backtest • Carteira)
 import io
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import plotly.graph_objs as go
-import plotly.express as pex  # <- alias definitivo (evita colisão com variáveis)
-from sklearn.covariance import LedoitWolf
-from statsmodels.tsa.ar_model import AutoReg
 import streamlit as st
+import plotly.express as pex
+import plotly.graph_objs as go
+from sklearn.covariance import LedoitWolf
 
-st.set_page_config(page_title="Finance Hub — Screener, Sinais, Previsões e Carteira", layout="wide")
+# ============================================================
+# Config
+# ============================================================
+st.set_page_config(page_title="Finance Hub — Yahoo Finance", layout="wide")
 
-# ============================= Helpers =============================
-@st.cache_data(show_spinner=False, ttl=60*30)
+# ============================================================
+# Helpers de dados (seguros/robustos)
+# ============================================================
+@st.cache_data(ttl=60*30, show_spinner=False)
 def fetch_history(tickers, period="3y", interval="1d"):
+    """Baixa histórico do Yahoo e normaliza para MultiIndex [ticker, campo]."""
     if isinstance(tickers, str):
         tickers = [tickers]
     data = yf.download(
@@ -29,6 +33,7 @@ def fetch_history(tickers, period="3y", interval="1d"):
     return data
 
 def split_close_volume(raw, fallback_ticker="TICKER"):
+    """Extrai Close (ou Adj Close) e Volume como DataFrames (colunas=tickers)."""
     if raw.empty:
         return pd.DataFrame(), pd.DataFrame()
     if not isinstance(raw.columns, pd.MultiIndex):
@@ -39,7 +44,8 @@ def split_close_volume(raw, fallback_ticker="TICKER"):
     volume = raw.xs("Volume", axis=1, level=1) if "Volume" in fields else pd.DataFrame(index=raw.index, columns=close.columns)
     return close, volume
 
-def pick_field_series(df_single_ticker, field_name):
+def pick_field_series(df_single_ticker: pd.DataFrame, field_name: str):
+    """Retorna Series para 'Open/High/Low/Close/Adj Close' mesmo se vier MultiIndex."""
     if df_single_ticker is None or df_single_ticker.empty:
         return None
     if isinstance(df_single_ticker.columns, pd.MultiIndex):
@@ -48,15 +54,15 @@ def pick_field_series(df_single_ticker, field_name):
             s = df_single_ticker.xs(field_name, axis=1, level=1)
             return s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s
         return None
-    else:
-        return df_single_ticker[field_name] if field_name in df_single_ticker.columns else None
+    return df_single_ticker[field_name] if field_name in df_single_ticker.columns else None
 
-def pick_close_series(df_single_ticker):
+def pick_close_series(df_single_ticker: pd.DataFrame):
+    """Escolhe Close -> Adj Close -> primeira coluna numérica disponível."""
     s = pick_field_series(df_single_ticker, "Close")
     if s is None:
         s = pick_field_series(df_single_ticker, "Adj Close")
     if s is None:
-        # fallback: primeira coluna numérica disponível
+        # cai para a 1ª coluna numérica
         for c in df_single_ticker.columns:
             series = pd.to_numeric(df_single_ticker[c], errors="coerce")
             if series.notna().any():
@@ -67,22 +73,25 @@ def pick_close_series(df_single_ticker):
 def _safe_pct_change(s, periods=1):
     return s.pct_change(periods=periods).replace([np.inf, -np.inf], np.nan)
 
-def compute_atr14(o, h, l, c):
-    tr1 = (h - l).abs()
-    tr2 = (h - c.shift()).abs()
-    tr3 = (l - c.shift()).abs()
+def compute_atr14(o: pd.Series, hi: pd.Series, lo: pd.Series, c: pd.Series):
+    tr1 = (hi - lo).abs()
+    tr2 = (hi - c.shift()).abs()
+    tr3 = (lo - c.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(14).mean()
 
-# ====================== Indicadores & Score ========================
+# ============================================================
+# Indicadores & Score (usados no Screener e na Análise)
+# ============================================================
 def indicators(df_close: pd.DataFrame):
     out = {}
-    out["sma20"] = df_close.rolling(20).mean()
-    out["sma50"] = df_close.rolling(50).mean()
+    out["sma20"]  = df_close.rolling(20).mean()
+    out["sma50"]  = df_close.rolling(50).mean()
     out["sma200"] = df_close.rolling(200).mean()
 
     delta = df_close.diff()
-    up = delta.clip(lower=0); down = -delta.clip(upper=0)
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
     rs = up.rolling(14).mean() / (down.rolling(14).mean().replace(0, np.nan))
     out["rsi14"] = 100 - (100 / (1 + rs))
 
@@ -91,157 +100,169 @@ def indicators(df_close: pd.DataFrame):
     macd = ema12 - ema26
     out["macd"] = macd
     out["macd_signal"] = macd.ewm(span=9, adjust=False).mean()
-    out["macd_hist"] = macd - out["macd_signal"]
+    out["macd_hist"] = out["macd"] - out["macd_signal"]
 
     ret = _safe_pct_change(df_close).fillna(0)
     out["vol20"] = ret.rolling(20).std() * np.sqrt(252)
-    out["ret_1d"] = _safe_pct_change(df_close, 1)
     out["ret_1w"] = _safe_pct_change(df_close, 5)
     out["ret_1m"] = _safe_pct_change(df_close, 21)
 
     roll_max = df_close.rolling(252).max()
     roll_min = df_close.rolling(252).min()
     out["dist_52w_high"] = (df_close / roll_max) - 1.0
-    out["dist_52w_low"] = (df_close / roll_min) - 1.0
+    out["dist_52w_low"]  = (df_close / roll_min) - 1.0
     return out
 
-def build_signal_score(close, ind):
+def build_signal_score(close: pd.DataFrame, ind: dict):
     last = close.tail(1); s20 = ind["sma20"].tail(1); s50 = ind["sma50"].tail(1); s200 = ind["sma200"].tail(1)
     rsi = ind["rsi14"].tail(1); macd = ind["macd"].tail(1); macd_sig = ind["macd_signal"].tail(1)
     vol20 = ind["vol20"].tail(1); ret1w = ind["ret_1w"].tail(1)
     dist_high = ind["dist_52w_high"].tail(1); dist_low = ind["dist_52w_low"].tail(1)
 
-    scores = []
-    for col in last.columns:
+    rows = []
+    for t in last.columns:
         sc = 50
-        if (last[col].iloc[0] > s20[col].iloc[0] > s50[col].iloc[0] > s200[col].iloc[0]): sc += 15
-        elif (last[col].iloc[0] < s20[col].iloc[0] < s50[col].iloc[0] < s200[col].iloc[0]): sc -= 15
+        if (last[t].iloc[0] > s20[t].iloc[0] > s50[t].iloc[0] > s200[t].iloc[0]): sc += 15
+        elif (last[t].iloc[0] < s20[t].iloc[0] < s50[t].iloc[0] < s200[t].iloc[0]): sc -= 15
 
-        val = rsi[col].iloc[0]
+        val = rsi[t].iloc[0]
         if pd.notna(val):
             if 50 <= val <= 60: sc += 5
             if 40 <= val < 50:  sc -= 5
             if val < 30:        sc += 10
             if val > 70:        sc -= 10
 
-        m = macd[col].iloc[0]; ms = macd_sig[col].iloc[0]
+        m = macd[t].iloc[0]; ms = macd_sig[t].iloc[0]
         if pd.notna(m) and pd.notna(ms): sc += 8 if m > ms else -8
 
-        if pd.notna(dist_high[col].iloc[0]) and dist_high[col].iloc[0] > -0.02: sc += 4
-        if pd.notna(dist_low[col].iloc[0]) and dist_low[col].iloc[0] < 0.02:    sc += 6
+        if pd.notna(dist_high[t].iloc[0]) and dist_high[t].iloc[0] > -0.02: sc += 4
+        if pd.notna(dist_low[t].iloc[0]) and dist_low[t].iloc[0] < 0.02:    sc += 6
 
-        if pd.notna(ret1w[col].iloc[0]):
-            if ret1w[col].iloc[0] > 0.03:  sc += 4
-            if ret1w[col].iloc[0] < -0.03: sc -= 4
+        if pd.notna(ret1w[t].iloc[0]):
+            if ret1w[t].iloc[0] > 0.03:  sc += 4
+            if ret1w[t].iloc[0] < -0.03: sc -= 4
 
-        if pd.notna(vol20[col].iloc[0]) and vol20[col].iloc[0] > 0.6: sc -= 5
-        scores.append((col, float(np.clip(sc, 0, 100))))
+        if pd.notna(vol20[t].iloc[0]) and vol20[t].iloc[0] > 0.6: sc -= 5
 
-    out = pd.DataFrame(scores, columns=["Ticker", "Score"]).set_index("Ticker")
-    out["Sinal"] = pd.cut(out["Score"], [-0.1,30,45,55,70,100.1], labels=["VENDA FORTE","VENDA","NEUTRO","COMPRA","COMPRA FORTE"])
+        rows.append((t, float(np.clip(sc, 0, 100))))
+
+    out = pd.DataFrame(rows, columns=["Ticker", "Score"]).set_index("Ticker")
+    out["Sinal"] = pd.cut(out["Score"], [-0.1, 30, 45, 55, 70, 100.1],
+                          labels=["VENDA FORTE","VENDA","NEUTRO","COMPRA","COMPRA FORTE"])
     return out
 
-# ============================= Sidebar =============================
+# ============================================================
+# Sidebar — universo e parâmetros
+# ============================================================
 st.sidebar.title("Universo de Ativos (Yahoo)")
-st.sidebar.caption("Exemplos: PETR4.SA, VALE3.SA, AAPL, MSFT, BTC-USD")
+st.sidebar.caption("Ex.: PETR4.SA, VALE3.SA, AAPL, MSFT, BTC-USD")
 
-default_b3 = "PETR4.SA, VALE3.SA, BBAS3.SA, ITUB4.SA, B3SA3.SA, WEGE3.SA, HGLG11.SA"
-default_us = "AAPL, MSFT, NVDA, TSLA, AMZN, SPY, QQQ"
+default_b3   = "PETR4.SA, VALE3.SA, BBAS3.SA, ITUB4.SA, B3SA3.SA, WEGE3.SA, HGLG11.SA"
+default_us   = "AAPL, MSFT, NVDA, TSLA, AMZN, SPY, QQQ"
 default_crypto = "BTC-USD, ETH-USD, SOL-USD"
 
 universe_choice = st.sidebar.selectbox("Base inicial", ["Custom","B3 (exemplo)","EUA (exemplo)","Cripto (exemplo)"], index=1)
-base = default_b3 if universe_choice=="B3 (exemplo)" else default_us if universe_choice=="EUA (exemplo)" else default_crypto if universe_choice=="Cripto (exemplo)" else ""
-tickers_text = st.sidebar.text_area("Tickers (separados por vírgula)", value=base, height=90)
+base_text = default_b3 if universe_choice=="B3 (exemplo)" else default_us if universe_choice=="EUA (exemplo)" else default_crypto if universe_choice=="Cripto (exemplo)" else ""
+tickers_text = st.sidebar.text_area("Tickers (separados por vírgula)", value=base_text, height=90)
 tickers = sorted(list({t.strip() for t in tickers_text.split(",") if t.strip()}))
-period = st.sidebar.selectbox("Período histórico", ["1y","2y","3y","5y","10y","max"], index=2)
+
+period   = st.sidebar.selectbox("Período histórico", ["1y","2y","3y","5y","10y","max"], index=2)
 interval = st.sidebar.selectbox("Intervalo", ["1d","1wk"], index=0)
+
 st.sidebar.markdown("---")
 st.sidebar.subheader("Parâmetros globais")
-risk_free = st.sidebar.number_input("Selic anual (proxy RF)", value=0.105, step=0.005, format="%.3f")
+risk_free   = st.sidebar.number_input("Selic anual (proxy RF)", value=0.105, step=0.005, format="%.3f")
 slippage_bp = st.sidebar.number_input("Slippage (bps por trade)", value=5, step=1)
 
 if not tickers:
-    st.info("Adicione ao menos 1 ticker para começar."); st.stop()
+    st.info("Adicione ao menos 1 ticker para começar.")
+    st.stop()
 
-# ============================= Tabs =============================
+# ============================================================
+# Abas
+# ============================================================
 tab1, tab2, tab3, tab4 = st.tabs(["🔎 Screener", "📈 Ativo & Sinais", "🧪 Backtest & Risco", "📊 Carteira"])
 
-# ----------------------------- TAB 1 -----------------------------
+# ------------------------------------------------------------
+# 1) Screener
+# ------------------------------------------------------------
 with tab1:
     st.header("🔎 Screener Multi-Ativos (Yahoo Finance)")
     with st.spinner("Baixando e processando cotações..."):
         raw = fetch_history(tickers, period=period, interval=interval)
         if raw.empty:
             st.error("Sem dados retornados pelo Yahoo."); st.stop()
+
         close, volume = split_close_volume(raw, fallback_ticker=(tickers[0] if tickers else "TICKER"))
         ind = indicators(close)
-        score_df = build_signal_score(close, ind)
+        ranking = build_signal_score(close, ind)
 
         st.subheader("Filtros Rápidos")
-        colf1, colf2, colf3, colf4 = st.columns(4)
-        rsi_min = colf1.slider("RSI mín", 0, 100, 0)
-        rsi_max = colf2.slider("RSI máx", 0, 100, 100)
-        mom_min = colf3.slider("Retorno 1M mín (%)", -50, 50, -50)
-        vol_max = colf4.slider("Volatilidade 20d máx (%, anual.)", 5, 200, 200)
+        c1, c2, c3, c4 = st.columns(4)
+        rsi_min = c1.slider("RSI mín", 0, 100, 0)
+        rsi_max = c2.slider("RSI máx", 0, 100, 100)
+        ret_min = c3.slider("Retorno 1M mín (%)", -50, 50, -50)
+        vol_max = c4.slider("Volatilidade 20d máx (%, a.a.)", 5, 200, 200)
 
-        last_row = close.tail(1).T.rename(columns=lambda x: "Último")
-        rsi_row = ind["rsi14"].tail(1).T.rename(columns=lambda x: "RSI14")
-        ret1m_row = (ind["ret_1m"].tail(1).T * 100).rename(columns=lambda x: "Ret_1M_%")
-        vol_row = (ind["vol20"].tail(1).T * 100).rename(columns=lambda x: "Vol20_%")
-        dist_high_row = (ind["dist_52w_high"].tail(1).T * 100).rename(columns=lambda x: "Dist_52w_High_%")
-        dist_low_row = (ind["dist_52w_low"].tail(1).T * 100).rename(columns=lambda x: "Dist_52w_Low_%")
-        vol_mean = volume.tail(20).mean().rename("Vol_Médio_20")
+        last_row      = close.tail(1).T.rename(columns=lambda _: "Último")
+        rsi_row       = ind["rsi14"].tail(1).T.rename(columns=lambda _: "RSI14")
+        ret1m_row     = (ind["ret_1m"].tail(1).T * 100).rename(columns=lambda _: "Ret_1M_%")
+        vol_row       = (ind["vol20"].tail(1).T * 100).rename(columns=lambda _: "Vol20_%")
+        d52h_row      = (ind["dist_52w_high"].tail(1).T * 100).rename(columns=lambda _: "Dist_52w_High_%")
+        d52l_row      = (ind["dist_52w_low"].tail(1).T  * 100).rename(columns=lambda _: "Dist_52w_Low_%")
+        vol_mean_row  = volume.tail(20).mean().rename("Vol_Médio_20")
 
-        table = (score_df.join(last_row, how="left")
-                        .join(rsi_row, how="left")
-                        .join(ret1m_row, how="left")
-                        .join(vol_row, how="left")
-                        .join(dist_high_row, how="left")
-                        .join(dist_low_row, how="left")
-                        .join(vol_mean, how="left")
+        table = (ranking.join(last_row, how="left")
+                        .join(rsi_row,  how="left")
+                        .join(ret1m_row,how="left")
+                        .join(vol_row,  how="left")
+                        .join(d52h_row, how="left")
+                        .join(d52l_row, how="left")
+                        .join(vol_mean_row, how="left")
                         .sort_values("Score", ascending=False))
 
         mask = (
             table["RSI14"].between(rsi_min, rsi_max, inclusive="both") &
-            (table["Ret_1M_%"].fillna(-1e9) >= mom_min) &
+            (table["Ret_1M_%"].fillna(-1e9) >= ret_min) &
             (table["Vol20_%"].fillna(1e9) <= vol_max)
         )
         table_f = table[mask].copy()
 
         st.caption("Dica: clique nas colunas para ordenar.")
         st.dataframe(
-            table_f.style.format({"Último":"{:.2f}","RSI14":"{:.1f}","Ret_1M_%":"{:.1f}","Vol20_%":"{:.1f}",
-                                  "Dist_52w_High_%":"{:.1f}","Dist_52w_Low_%":"{:.1f}","Vol_Médio_20":"{:,.0f}"}),
+            table_f.style.format({"Último":"{:.2f}","RSI14":"{:.1f}","Ret_1M_%":"{:.1f}",
+                                  "Vol20_%":"{:.1f}","Dist_52w_High_%":"{:.1f}",
+                                  "Dist_52w_Low_%":"{:.1f}", "Vol_Médio_20":"{:,.0f}"}),
             use_container_width=True, height=480
         )
 
-        st.subheader("Ranking (Score → 0–100)")
-        st.plotly_chart(pex.bar(table_f.reset_index(), x="Ticker", y="Score", color="Sinal", height=420), use_container_width=True)
+        st.subheader("Ranking por Score")
+        st.plotly_chart(pex.bar(table_f.reset_index(), x="Ticker", y="Score", color="Sinal", height=420),
+                        use_container_width=True)
         st.markdown("**Legenda:** 0–30 (Venda forte) · 30–45 (Venda) · 45–55 (Neutro) · 55–70 (Compra) · 70–100 (Compra forte)")
 
-# ----------------------------- TAB 2 -----------------------------
+# ------------------------------------------------------------
+# 2) Ativo & Sinais
+# ------------------------------------------------------------
 with tab2:
     st.header("📈 Análise do Ativo — Gráfico + Indicadores + Regras")
     sel = st.selectbox("Escolha um ativo", tickers, index=0)
 
-    with st.spinner("Baixando OHLCV completo do ativo…"):
-        df_single = yf.download(sel, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
+    with st.spinner("Baixando OHLCV do ativo…"):
+        df1 = yf.download(sel, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
 
-    if df_single.empty:
-        st.warning("Sem dados para o ticker selecionado."); st.stop()
+    if df1.empty:
+        st.warning("Sem dados para o ticker."); st.stop()
 
-    # Fechamento para indicadores
-    pclose = pick_close_series(df_single)
+    pclose = pick_close_series(df1)
     if pclose is None or pclose.dropna().empty:
-        st.error("Não foi possível determinar a série de fechamento para este ativo."); st.stop()
+        st.error("Não foi possível determinar a série de fechamento."); st.stop()
 
-    # Séries OHLC para o gráfico
-    o = pick_field_series(df_single, "Open")
-    hi = pick_field_series(df_single, "High")
-    lo = pick_field_series(df_single, "Low")
-    c_plot = pick_field_series(df_single, "Close") or pick_field_series(df_single, "Adj Close")
+    o     = pick_field_series(df1, "Open")
+    hi    = pick_field_series(df1, "High")
+    lo    = pick_field_series(df1, "Low")
+    c_plot= pick_field_series(df1, "Close") or pick_field_series(df1, "Adj Close")
 
-    # Se algum OHLC faltar, plota linha do fechamento (pclose)
     if any(s is None or s.dropna().empty for s in [o, hi, lo, c_plot]):
         st.warning("OHLC incompleto para Candlestick. Mostrando linha do fechamento.")
         fig_line = pex.line(pclose.rename("Close"))
@@ -249,221 +270,192 @@ with tab2:
         st.plotly_chart(fig_line, use_container_width=True)
         atr_last = np.nan
     else:
-        tmp = pd.DataFrame({"Open": o, "High": hi, "Low": lo, "Close": c_plot}).dropna()
-        atr_series = compute_atr14(tmp["Open"], tmp["High"], tmp["Low"], tmp["Close"])
-        atr_last = float(atr_series.iloc[-1]) if atr_series.notna().any() else np.nan
+        tmp = pd.DataFrame({"Open":o, "High":hi, "Low":lo, "Close":c_plot}).dropna()
+        atr_last = float(compute_atr14(tmp["Open"], tmp["High"], tmp["Low"], tmp["Close"]).iloc[-1])
 
         fig_c = go.Figure()
-        fig_c.add_trace(go.Candlestick(
-            x=tmp.index, open=tmp["Open"], high=tmp["High"], low=tmp["Low"], close=tmp["Close"], name="Preço"
-        ))
-        # médias móveis sobre o candle
-        sma20_plot = pclose.rolling(20).mean().reindex(tmp.index)
-        sma50_plot = pclose.rolling(50).mean().reindex(tmp.index)
-        sma200_plot = pclose.rolling(200).mean().reindex(tmp.index)
-        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma20_plot, name="SMA20", mode="lines"))
-        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma50_plot, name="SMA50", mode="lines"))
-        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma200_plot, name="SMA200", mode="lines"))
+        fig_c.add_trace(go.Candlestick(x=tmp.index, open=tmp["Open"], high=tmp["High"],
+                                       low=tmp["Low"],  close=tmp["Close"], name="Preço"))
+        sma20  = pclose.rolling(20).mean().reindex(tmp.index)
+        sma50  = pclose.rolling(50).mean().reindex(tmp.index)
+        sma200 = pclose.rolling(200).mean().reindex(tmp.index)
+        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma20,  name="SMA20",  mode="lines"))
+        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma50,  name="SMA50",  mode="lines"))
+        fig_c.add_trace(go.Scatter(x=tmp.index, y=sma200, name="SMA200", mode="lines"))
         fig_c.update_layout(height=520, xaxis_rangeslider_visible=False, legend=dict(orientation="h"))
         st.plotly_chart(fig_c, use_container_width=True)
 
-    # Indicadores e métricas (base pclose)
-    price_last = float(pclose.iloc[-1])
-    sma20  = pclose.rolling(20).mean()
-    sma50  = pclose.rolling(50).mean()
-    sma200 = pclose.rolling(200).mean()
+    # Métricas
     ema12  = pclose.ewm(span=12, adjust=False).mean()
     ema26  = pclose.ewm(span=26, adjust=False).mean()
     macd   = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    delta = pclose.diff()
-    up = delta.clip(lower=0); down = -delta.clip(upper=0)
-    rsi = 100 - 100 / (1 + (up.rolling(14).mean() / down.rolling(14).mean()))
+    macd_s = macd.ewm(span=9,  adjust=False).mean()
+    delta  = pclose.diff()
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    rsi14 = 100 - 100/(1 + (up.rolling(14).mean() / down.rolling(14).mean()))
 
-    colA, colB, colC, colD = st.columns(4)
-    colA.metric("Preço", f"{price_last:.2f}")
-    colB.metric("ATR14", f"{atr_last:.2f}" if np.isfinite(atr_last) else "—")
-    colC.metric("RSI14", f"{float(rsi.iloc[-1]):.1f}" if not np.isnan(rsi.iloc[-1]) else "—")
-    colD.metric("MACD-σ", f"{float(macd.iloc[-1]-macd_sig.iloc[-1]):.3f}")
+    cA, cB, cC, cD = st.columns(4)
+    cA.metric("Preço", f"{float(pclose.iloc[-1]):.2f}")
+    cB.metric("ATR14", f"{atr_last:.2f}" if np.isfinite(atr_last) else "—")
+    cC.metric("RSI14", f"{float(rsi14.iloc[-1]):.1f}" if not np.isnan(rsi14.iloc[-1]) else "—")
+    cD.metric("MACD-σ", f"{float(macd.iloc[-1]-macd_s.iloc[-1]):.3f}")
 
-    st.subheader("Score & Sinal (mesma régua do Screener)")
-    tmp_close = pclose.to_frame(sel)
-    ind_one = indicators(tmp_close)
-    score_one = build_signal_score(tmp_close, ind_one)
+    st.subheader("Score & Sinal (régua do Screener)")
+    ind_one = indicators(pclose.to_frame(sel))
+    score_one = build_signal_score(pclose.to_frame(sel), ind_one)
     st.dataframe(score_one, use_container_width=True)
 
-# ----------------------------- TAB 3 -----------------------------
+# ------------------------------------------------------------
+# 3) Backtest & Risco
+# ------------------------------------------------------------
 with tab3:
-    st.header("🧪 Backtest Rápido + Gestão de Risco (ATR/Stop/TP)")
-    sel2 = st.selectbox("Ativo para backtest", tickers, index=min(1, len(tickers)-1))
-    entry_logic = st.selectbox("Lógica de entrada", ["Cruzamento SMA20>50", "MACD > Sinal", "RSI<30 (reversão)"], index=0)
-    exit_logic = st.selectbox("Saída", ["Stop ATR & Take Profit R", "Cruzamento SMA20<50", "MACD < Sinal", "RSI>70"], index=0)
-    atr_mult = st.slider("Stop ATR (x)", 0.5, 6.0, 2.0, 0.5)
-    take_R = st.slider("Take Profit (R múltiplos)", 0.5, 6.0, 2.0, 0.5)
-    fixed_risk = st.number_input("Risco fixo por trade (% do capital)", 0.5, 10.0, 1.0, 0.5)
-    slippage = (slippage_bp / 10000.0)
+    st.header("🧪 Backtest Rápido + Gestão de Risco")
+    sel2      = st.selectbox("Ativo para backtest", tickers, index=min(1, len(tickers)-1))
+    entry_l   = st.selectbox("Entrada", ["Cruzamento SMA20>50", "MACD > Sinal", "RSI<30"], index=0)
+    exit_l    = st.selectbox("Saída",   ["Stop ATR & Take Profit R", "Cruzamento SMA20<50", "MACD < Sinal", "RSI>70"], index=0)
+    atr_mult  = st.slider("Stop ATR (x)", 0.5, 6.0, 2.0, 0.5)
+    take_R    = st.slider("Take Profit (R múltiplos)", 0.5, 6.0, 2.0, 0.5)
+    fixed_risk= st.number_input("Risco fixo por trade (% do capital)", 0.5, 10.0, 1.0, 0.5)
+    slippage  = (slippage_bp / 10000.0)
 
-    with st.spinner("Preparando dados para backtest…"):
+    with st.spinner("Preparando dados…"):
         df_bt = yf.download(sel2, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
         if df_bt.empty:
-            st.warning("Sem dados para backtest.")
+            st.warning("Sem dados para backtest."); st.stop()
+
+        o = pick_field_series(df_bt, "Open"); hi = pick_field_series(df_bt, "High")
+        lo = pick_field_series(df_bt, "Low");  c = pick_close_series(df_bt)
+        if any(s is None or s.dropna().empty for s in [o, hi, lo, c]):
+            st.warning("Dados insuficientes p/ backtest."); st.stop()
+
+        df_bt = pd.DataFrame({"Open":o, "High":hi, "Low":lo, "Close":c}).dropna()
+        df_bt["SMA20"] = df_bt["Close"].rolling(20).mean()
+        df_bt["SMA50"] = df_bt["Close"].rolling(50).mean()
+        ema12 = df_bt["Close"].ewm(span=12, adjust=False).mean()
+        ema26 = df_bt["Close"].ewm(span=26, adjust=False).mean()
+        df_bt["MACD"] = ema12 - ema26
+        df_bt["MACD_SIG"] = df_bt["MACD"].ewm(span=9, adjust=False).mean()
+        delta = df_bt["Close"].diff(); up = delta.clip(lower=0); down = -delta.clip(upper=0)
+        df_bt["RSI"] = 100 - 100/(1 + (up.rolling(14).mean() / down.rolling(14).mean()))
+        df_bt["ATR"] = compute_atr14(df_bt["Open"], df_bt["High"], df_bt["Low"], df_bt["Close"])
+
+        if entry_l == "Cruzamento SMA20>50":
+            df_bt["ENTRY"] = (df_bt["SMA20"] > df_bt["SMA50"]) & (df_bt["SMA20"].shift(1) <= df_bt["SMA50"].shift(1))
+        elif entry_l == "MACD > Sinal":
+            df_bt["ENTRY"] = (df_bt["MACD"] > df_bt["MACD_SIG"]) & (df_bt["MACD"].shift(1) <= df_bt["MACD_SIG"].shift(1))
         else:
-            o = pick_field_series(df_bt, "Open"); hi = pick_field_series(df_bt, "High")
-            lo = pick_field_series(df_bt, "Low"); pclose_bt = pick_close_series(df_bt)
-            if any(s is None or s.dropna().empty for s in [o, hi, lo, pclose_bt]):
-                st.warning("Dados insuficientes p/ backtest."); st.stop()
-            df_bt = pd.DataFrame({"Open":o,"High":hi,"Low":lo,"Close":pclose_bt}).dropna()
+            df_bt["ENTRY"] = (df_bt["RSI"] < 30) & (df_bt["RSI"].shift(1) >= 30)
 
-            df_bt["SMA20"] = df_bt["Close"].rolling(20).mean()
-            df_bt["SMA50"] = df_bt["Close"].rolling(50).mean()
-            ema12 = df_bt["Close"].ewm(span=12, adjust=False).mean()
-            ema26 = df_bt["Close"].ewm(span=26, adjust=False).mean()
-            df_bt["MACD"] = ema12 - ema26
-            df_bt["MACD_SIG"] = df_bt["MACD"].ewm(span=9, adjust=False).mean()
-            delta = df_bt["Close"].diff(); up = delta.clip(lower=0); down = -delta.clip(upper=0)
-            df_bt["RSI"] = 100 - 100 / (1 + (up.rolling(14).mean() / down.rolling(14).mean()))
-            df_bt["ATR"] = compute_atr14(df_bt["Open"], df_bt["High"], df_bt["Low"], df_bt["Close"])
+        if exit_l == "Cruzamento SMA20<50":
+            df_bt["EXIT"]  = (df_bt["SMA20"] < df_bt["SMA50"]) & (df_bt["SMA20"].shift(1) >= df_bt["SMA50"].shift(1))
+        elif exit_l == "MACD < Sinal":
+            df_bt["EXIT"]  = (df_bt["MACD"] < df_bt["MACD_SIG"]) & (df_bt["MACD"].shift(1) >= df_bt["MACD_SIG"].shift(1))
+        elif exit_l == "RSI>70":
+            df_bt["EXIT"]  = (df_bt["RSI"] > 70) & (df_bt["RSI"].shift(1) <= 70)
+        else:
+            df_bt["EXIT"]  = False
 
-            if entry_logic == "Cruzamento SMA20>50":
-                df_bt["ENTRY"] = (df_bt["SMA20"] > df_bt["SMA50"]) & (df_bt["SMA20"].shift(1) <= df_bt["SMA50"].shift(1))
-            elif entry_logic == "MACD > Sinal":
-                df_bt["ENTRY"] = (df_bt["MACD"] > df_bt["MACD_SIG"]) & (df_bt["MACD"].shift(1) <= df_bt["MACD_SIG"].shift(1))
-            else:
-                df_bt["ENTRY"] = (df_bt["RSI"] < 30) & (df_bt["RSI"].shift(1) >= 30)
+        trades = []; in_pos = False; capital = 100000.0
+        for i in range(1, len(df_bt)):
+            row = df_bt.iloc[i]
+            if (not in_pos) and row["ENTRY"]:
+                stop = row["Close"] - atr_mult * row["ATR"]
+                risk_per_share = max(row["Close"] - stop, 1e-6)
+                qty = max(int((capital*(fixed_risk/100.0))/risk_per_share), 1)
+                entry_px = row["Close"] * (1 + slippage)
+                stop_px  = stop
+                tp_px    = entry_px + take_R * (entry_px - stop_px)
+                in_pos = True
+                trades.append({"open_time": df_bt.index[i], "open_px": entry_px, "qty": qty,
+                               "stop_px": stop_px, "tp_px": tp_px,
+                               "close_time": None, "close_px": None, "ret": None})
+                continue
 
-            if exit_logic == "Cruzamento SMA20<50":
-                df_bt["EXIT"] = (df_bt["SMA20"] < df_bt["SMA50"]) & (df_bt["SMA20"].shift(1) >= df_bt["SMA50"].shift(1))
-            elif exit_logic == "MACD < Sinal":
-                df_bt["EXIT"] = (df_bt["MACD"] < df_bt["MACD_SIG"]) & (df_bt["MACD"].shift(1) >= df_bt["MACD_SIG"].shift(1))
-            elif exit_logic == "RSI>70":
-                df_bt["EXIT"] = (df_bt["RSI"] > 70) & (df_bt["RSI"].shift(1) <= 70)
-            else:
-                df_bt["EXIT"] = False
+            if in_pos:
+                low  = row["Low"]  * (1 - slippage)
+                high = row["High"] * (1 - slippage)
+                exit_px = None
+                if low <= trades[-1]["stop_px"]:
+                    exit_px = trades[-1]["stop_px"]
+                elif high >= trades[-1]["tp_px"]:
+                    exit_px = trades[-1]["tp_px"]
+                elif row["EXIT"]:
+                    exit_px = row["Close"] * (1 - slippage)
 
-            trades = []; in_pos = False; capital = 100000.0
-            for i in range(1, len(df_bt)):
-                row = df_bt.iloc[i]
-                if (not in_pos) and row["ENTRY"]:
-                    stop = row["Close"] - atr_mult * row["ATR"]
-                    risk_per_share = max(row["Close"] - stop, 1e-6)
-                    qty = max(int((capital*(fixed_risk/100.0))/risk_per_share), 1)
-                    entry_px = row["Close"] * (1 + slippage)
-                    stop_px = stop; tp_px = entry_px + take_R * (entry_px - stop_px)
-                    in_pos = True
-                    trades.append({"open_time": df_bt.index[i], "open_px": entry_px, "qty": qty,
-                                   "stop_px": stop_px, "tp_px": tp_px, "close_time": None, "close_px": None, "ret": None})
-                    continue
-                if in_pos:
-                    low = row["Low"] * (1 - slippage); high = row["High"] * (1 - slippage)
-                    exit_px = None
-                    if low <= trades[-1]["stop_px"]:
-                        exit_px = trades[-1]["stop_px"]
-                    elif high >= trades[-1]["tp_px"]:
-                        exit_px = trades[-1]["tp_px"]
-                    elif row["EXIT"]:
-                        exit_px = row["Close"] * (1 - slippage)
-                    if exit_px is not None:
-                        trades[-1]["close_time"] = df_bt.index[i]; trades[-1]["close_px"] = exit_px
-                        pnl = (exit_px - trades[-1]["open_px"]) * trades[-1]["qty"]
-                        trades[-1]["ret"] = pnl / capital; capital *= (1 + trades[-1]["ret"]); in_pos = False
+                if exit_px is not None:
+                    trades[-1]["close_time"] = df_bt.index[i]
+                    trades[-1]["close_px"]   = exit_px
+                    pnl = (exit_px - trades[-1]["open_px"]) * trades[-1]["qty"]
+                    trades[-1]["ret"] = pnl / capital
+                    capital *= (1 + trades[-1]["ret"])
+                    in_pos = False
 
-            if trades and trades[-1]["close_time"] is None:
-                last_px = df_bt["Close"].iloc[-1] * (1 - slippage)
-                trades[-1]["close_time"] = df_bt.index[-1]; trades[-1]["close_px"] = last_px
-                pnl = (last_px - trades[-1]["open_px"]) * trades[-1]["qty"]
-                trades[-1]["ret"] = pnl / capital
+        if trades and trades[-1]["close_time"] is None:
+            last_px = df_bt["Close"].iloc[-1] * (1 - slippage)
+            trades[-1]["close_time"] = df_bt.index[-1]
+            trades[-1]["close_px"]   = last_px
+            pnl = (last_px - trades[-1]["open_px"]) * trades[-1]["qty"]
+            trades[-1]["ret"] = pnl / capital
 
-            trdf = pd.DataFrame(trades)
-            if trdf.empty:
-                st.warning("Nenhuma operação gerada.")
-            else:
-                st.subheader("Resumo dos Trades")
-                st.dataframe(trdf[["open_time","open_px","close_time","close_px","ret"]]
-                             .style.format({"open_px":"{:.2f}","close_px":"{:.2f}","ret":"{:.2%}"}),
-                             use_container_width=True)
-                st.caption(f"Capital final simulado (teórico): **R$ {capital:,.2f}**".replace(",", "X").replace(".", ",").replace("X","."))
+        trdf = pd.DataFrame(trades)
+        if trdf.empty:
+            st.warning("Nenhuma operação gerada.")
+        else:
+            st.subheader("Resumo dos Trades")
+            st.dataframe(
+                trdf[["open_time","open_px","close_time","close_px","ret"]]
+                .style.format({"open_px":"{:.2f}","close_px":"{:.2f}","ret":"{:.2%}"}),
+                use_container_width=True
+            )
+            st.caption(f"Capital final simulado (teórico): **R$ {capital:,.2f}**".replace(",", "X").replace(".", ",").replace("X","."))
 
-                curve = pd.Series(100000.0, index=df_bt.index, dtype=float); cap = 100000.0
-                for _, tr in trdf.iterrows():
-                    if pd.notna(tr["close_time"]):
-                        cap *= (1 + tr["ret"]); curve.loc[tr["close_time"]:] = cap
-                st.plotly_chart(pex.line(curve.rename("Equity Curve"), title="Curva de Capital (aprox.)"), use_container_width=True)
+            curve = pd.Series(100000.0, index=df_bt.index, dtype=float)
+            cap = 100000.0
+            for _, tr in trdf.iterrows():
+                if pd.notna(tr["close_time"]):
+                    cap *= (1 + tr["ret"])
+                    curve.loc[tr["close_time"]:] = cap
 
-# ----------------------------- TAB 4 -----------------------------
+            st.plotly_chart(pex.line(curve.rename("Equity Curve"), title="Curva de Capital (aprox.)"),
+                            use_container_width=True)
+
+# ------------------------------------------------------------
+# 4) Carteira — Markowitz (Ledoit-Wolf)
+# ------------------------------------------------------------
 with tab4:
-    st.header("📊 Carteira — Markowitz (Ledoit-Wolf) + Simulação")
+    st.header("📊 Carteira — Markowitz (Ledoit-Wolf) com simulação")
     with st.spinner("Coletando dados…"):
         raw2 = fetch_history(tickers, period=period, interval="1d")
         if raw2.empty:
             st.error("Sem dados para os tickers."); st.stop()
         close2, _ = split_close_volume(raw2, fallback_ticker=(tickers[0] if tickers else "TICKER"))
-        close2 = close2.dropna(how="all"); rets = close2.pct_change().dropna(how="all")
+        close2 = close2.dropna(how="all")
+        rets   = close2.pct_change().dropna(how="any")
 
     mu = rets.mean() * 252
-    lw = LedoitWolf().fit(rets.fillna(0.0))
-    cov = pd.DataFrame(lw.covariance_, index=rets.columns, columns=rets.columns)
+    cov_lw = LedoitWolf().fit(rets.values).covariance_
+    cov = pd.DataFrame(cov_lw, index=rets.columns, columns=rets.columns) * 252
 
-    n = len(rets.columns)
     sims = st.slider("Número de simulações de carteira", 200, 5000, 1500, 100)
-    Ws = np.random.dirichlet(np.ones(n), size=sims)
-    port_mu = Ws @ mu.values
-    port_vol = np.sqrt(np.einsum("ij,jk,ik->i", Ws, cov.values*252, Ws))
-    sharpe = (port_mu - risk_free) / np.where(port_vol==0, np.nan, port_vol)
-    st.plotly_chart(pex.scatter(pd.DataFrame({"Retorno":port_mu,"Vol":port_vol,"Sharpe":sharpe}),
-                                x="Vol", y="Retorno", color="Sharpe", title="Fronteira (simulada)", height=520),
+    Ws = np.random.dirichlet(np.ones(len(rets.columns)), size=sims)
+    port_mu  = Ws @ mu.values
+    port_vol = np.sqrt(np.einsum("ij,jk,ik->i", Ws, cov.values, Ws))
+    sharpe   = (port_mu - risk_free) / np.where(port_vol==0, np.nan, port_vol)
+
+    df_ports = pd.DataFrame({"Vol":port_vol, "Retorno":port_mu, "Sharpe":sharpe})
+    st.plotly_chart(pex.scatter(df_ports, x="Vol", y="Retorno", color="Sharpe",
+                                title="Fronteira (simulada)", height=520),
                     use_container_width=True)
 
-    best_idx = np.nanargmax(sharpe); best_w = Ws[best_idx]
-    weights = pd.Series(best_w, index=rets.columns).sort_values(ascending=False)
+    best_idx = int(np.nanargmax(sharpe))
+    best_w = pd.Series(Ws[best_idx], index=rets.columns).sort_values(ascending=False)
+
     st.subheader("Pesos sugeridos (máx. Sharpe simulado)")
-    st.dataframe((weights*100).to_frame("Peso_%").style.format("{:.2f}"), use_container_width=True)
+    st.dataframe((best_w*100).to_frame("Peso_%").style.format("{:.2f}"), use_container_width=True)
 
-    buff = io.StringIO(); (weights*100).to_csv(buff, header=["Peso_%"])
-    st.download_button("Baixar pesos em CSV", data=buff.getvalue(), file_name="pesos_portfolio.csv", mime="text/csv")
+    buff = io.StringIO()
+    (best_w*100).to_csv(buff, header=["Peso_%"])
+    st.download_button("Baixar pesos em CSV", data=buff.getvalue(),
+                       file_name="pesos_portfolio.csv", mime="text/csv")
 
-# ---------------------- EXTRA — Previsões ------------------------
-st.markdown("---")
-with st.expander("🔮 Previsões curtas & Monte Carlo (opcional)"):
-    sel3 = st.selectbox("Ativo", tickers, key="pred_sel")
-    horizon = st.slider("Horizonte (dias úteis)", 5, 120, 30, 5)
-    model = st.selectbox("Modelo", ["AR(1) em retornos", "GBM (Monte Carlo)"], index=0)
-    paths = st.slider("Caminhos MC", 100, 3000, 500, 100)
-
-    with st.spinner("Calculando…"):
-        df_pred = yf.download(sel3, period="3y", interval="1d", progress=False)
-        if df_pred.empty:
-            st.warning("Sem dados para previsão.")
-        else:
-            pclose_pred = pick_close_series(df_pred) or df_pred.get("Close")
-            if pclose_pred is None or pclose_pred.dropna().empty:
-                st.warning("Sem série de fechamento para previsão."); st.stop()
-
-            p0 = float(pclose_pred.iloc[-1])
-            if model == "AR(1) em retornos":
-                r = pclose_pred.pct_change().dropna()
-                try:
-                    ar = AutoReg(r, lags=1, old_names=False).fit()
-                    mu = ar.params.get("const", r.mean()); phi = ar.params.get("r.L1", 0.0); eps = r.std()
-                except Exception:
-                    mu, phi, eps = r.mean(), 0.0, r.std()
-                sim = np.zeros((horizon, paths))
-                sim[0] = mu + phi * r.iloc[-1] + np.random.normal(0, eps, size=paths)
-                for t in range(1, horizon):
-                    sim[t] = mu + phi * sim[t-1] + np.random.normal(0, eps, size=paths)
-                price_paths = p0 * (1 + sim).cumprod(axis=0)
-                idx_future = pd.bdate_range(df_pred.index[-1], periods=horizon, inclusive="right")
-            else:
-                r = pclose_pred.pct_change().dropna()
-                mu = r.mean(); sigma = r.std(); dt = 1/252
-                Z = np.random.normal(size=(horizon, paths))
-                price_paths = np.zeros((horizon+1, paths)); price_paths[0] = p0
-                for t in range(1, horizon+1):
-                    price_paths[t] = price_paths[t-1] * np.exp((mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*Z[t-1])
-                idx_future = pd.bdate_range(df_pred.index[-1], periods=horizon+1, inclusive="right")
-
-            df_paths = pd.DataFrame(price_paths, index=idx_future[:price_paths.shape[0]])
-            st.plotly_chart(pex.line(df_paths.iloc[:, :min(50, paths)], title=f"Simulações — {sel3}"), use_container_width=True)
-            q = np.nanpercentile(price_paths[-1], [5,25,50,75,95])
-            st.write(pd.DataFrame({"P5":[q[0]],"P25":[q[1]],"P50":[q[2]],"P75":[q[3]],"P95":[q[4]]}).style.format("{:.2f}"))
-
-st.success("Versão corrigida: alias Plotly = 'pex', séries OHLC = o/hi/lo/c_plot, fechamento = 'pclose'.")
+st.success("Pronto! App limpo com Screener, Análise, Backtest e Carteira (com covariância Ledoit-Wolf).")
